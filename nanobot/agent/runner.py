@@ -267,6 +267,10 @@ class AgentRunner:
                     messages_for_model = messages
             context = AgentHookContext(iteration=iteration, messages=messages)
             await hook.before_iteration(context)
+            modified_messages = await hook.before_model_call(context)
+            # logger.debug("modified_messages: {}", str(modified_messages))
+            if modified_messages is not None:
+                messages_for_model = modified_messages
             response = await self._request_model(spec, messages_for_model, hook, context)
             raw_usage = self._usage_dict(response.usage)
             context.response = response

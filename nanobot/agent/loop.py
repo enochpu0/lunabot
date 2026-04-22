@@ -161,12 +161,14 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
+        plugin_manager: "Any" = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
         self.bus = bus
+        self._plugin_manager = plugin_manager
         self.channels_config = channels_config
         self.provider = provider
         self.workspace = workspace
@@ -345,36 +347,6 @@ class AgentLoop:
 
         return format_tool_hints(tool_calls)
 
-    async def _dispatch_command_inline(
-        self,
-        msg: InboundMessage,
-        key: str,
-        raw: str,
-        dispatch_fn: Callable[[CommandContext], Awaitable[OutboundMessage | None]],
-    ) -> None:
-        """Dispatch a command directly from the run() loop and publish the result."""
-        ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
-        result = await dispatch_fn(ctx)
-        if result:
-            await self.bus.publish_outbound(result)
-        else:
-            logger.warning("Command '{}' matched but dispatch returned None", raw)
-
-    async def _cancel_active_tasks(self, key: str) -> int:
-        """Cancel and await all active tasks and subagents for *key*.
-
-        Returns the total number of cancelled tasks + subagents.
-        """
-        tasks = self._active_tasks.pop(key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        sub_cancelled = await self.subagents.cancel_by_session(key)
-        return cancelled + sub_cancelled
-
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
         if self._unified_session and not msg.session_key_override:
@@ -490,6 +462,9 @@ class AgentLoop:
         while self._running:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+                # Let plugins process the message before AgentLoop handles it.
+                if self._plugin_manager is not None:
+                    msg = await self._plugin_manager.dispatch_inbound(msg)
             except asyncio.TimeoutError:
                 self.auto_compact.check_expired(
                     self._schedule_background,
@@ -508,24 +483,16 @@ class AgentLoop:
 
             raw = msg.content.strip()
             if self.commands.is_priority(raw):
-                await self._dispatch_command_inline(
-                    msg, msg.session_key, raw,
-                    self.commands.dispatch_priority,
-                )
+                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
+                result = await self.commands.dispatch_priority(ctx)
+                if result:
+                    await self.bus.publish_outbound(result)
                 continue
             effective_key = self._effective_session_key(msg)
             # If this session already has an active pending queue (i.e. a task
             # is processing this session), route the message there for mid-turn
             # injection instead of creating a competing task.
             if effective_key in self._pending_queues:
-                # Non-priority commands must not be queued for injection;
-                # dispatch them directly (same pattern as priority commands).
-                if self.commands.is_dispatchable_command(raw):
-                    await self._dispatch_command_inline(
-                        msg, effective_key, raw,
-                        self.commands.dispatch,
-                    )
-                    continue
                 pending_msg = msg
                 if effective_key != msg.session_key:
                     pending_msg = dataclasses.replace(
@@ -545,6 +512,7 @@ class AgentLoop:
                         effective_key,
                     )
                     continue
+            logger.info("No active task for session {}, creating new task", effective_key)
             # Compute the effective session key before dispatching
             # This ensures /stop command can find tasks correctly when unified session is enabled
             task = asyncio.create_task(self._dispatch(msg))
@@ -701,6 +669,7 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
+        logger.info("_process_message 000 ",msg.content)
         if msg.channel == "system":
             channel, chat_id = (
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)

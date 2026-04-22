@@ -335,6 +335,7 @@ def onboard(
             console.print(f"[red]✗[/red] Error during configuration: {e}")
             console.print("[yellow]Please run 'nanobot onboard' again to complete setup.[/yellow]")
             raise typer.Exit(1)
+    _onboard_channels(config_path)
     _onboard_plugins(config_path)
 
     # Create workspace, preferring the configured workspace path.
@@ -379,7 +380,7 @@ def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
     return merged
 
 
-def _onboard_plugins(config_path: Path) -> None:
+def _onboard_channels(config_path: Path) -> None:
     """Inject default config for all discovered channels (built-in + plugins)."""
     import json
 
@@ -398,6 +399,30 @@ def _onboard_plugins(config_path: Path) -> None:
             channels[name] = cls.default_config()
         else:
             channels[name] = _merge_missing_defaults(channels[name], cls.default_config())
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _onboard_plugins(config_path: Path) -> None:
+    """Inject default config for all discovered plugins."""
+    import json
+
+    from nanobot.plugins.registry import discover_all_plugins
+
+    all_plugins = discover_all_plugins()
+    if not all_plugins:
+        return
+
+    with open(config_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    plugins = data.setdefault("plugins", {})
+    for name, cls in all_plugins.items():
+        if name not in plugins:
+            plugins[name] = cls.default_config()
+        else:
+            plugins[name] = _merge_missing_defaults(plugins[name], cls.default_config())
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -667,6 +692,13 @@ def _run_gateway(
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
+    # Create plugin manager (discovered plugins that may hook into the agent loop).
+    from nanobot.plugins.manager import PluginManager
+    plugin_manager = PluginManager(config.plugins, bus)
+
+    if plugin_manager.enabled_plugins:
+        console.print(f"[green]✓[/green] Plugins enabled: {', '.join(plugin_manager.enabled_plugins)}")
+
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
     if is_default_workspace(config.workspace_path):
         _migrate_cron_store(config)
@@ -698,6 +730,8 @@ def _run_gateway(
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
         tools_config=config.tools,
+        hooks=list(plugin_manager.enabled_agent_hooks),
+        plugin_manager=plugin_manager,
     )
 
     # Set cron callback (needs agent)
@@ -928,6 +962,7 @@ def _run_gateway(
             tasks = [
                 agent.run(),
                 channels.start_all(),
+                plugin_manager.start_all(),
                 _health_server(config.gateway.host, port),
             ]
             if open_browser_url:
@@ -945,6 +980,7 @@ def _run_gateway(
             heartbeat.stop()
             cron.stop()
             agent.stop()
+            await plugin_manager.stop_all()
             await channels.stop_all()
 
     asyncio.run(run())
@@ -1400,24 +1436,30 @@ app.add_typer(plugins_app, name="plugins")
 
 
 @plugins_app.command("list")
-def plugins_list():
-    """List all discovered channels (built-in and plugins)."""
-    from nanobot.channels.registry import discover_all, discover_channel_names
-    from nanobot.config.loader import load_config
+def plugins_list(
+    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """List all discovered nanobot plugins."""
+    from nanobot.config.loader import load_config, set_config_path
+    from nanobot.plugins.registry import discover_all_plugins, discover_plugin_names
 
-    config = load_config()
-    builtin_names = set(discover_channel_names())
-    all_channels = discover_all()
+    resolved_config_path = Path(config_path).expanduser().resolve() if config_path else None
+    if resolved_config_path is not None:
+        set_config_path(resolved_config_path)
 
-    table = Table(title="Channel Plugins")
+    config = load_config(resolved_config_path)
+    builtin_names = set(discover_plugin_names())
+    all_plugins = discover_all_plugins()
+
+    table = Table(title="Nanobot Plugins")
     table.add_column("Name", style="cyan")
     table.add_column("Source", style="magenta")
     table.add_column("Enabled")
 
-    for name in sorted(all_channels):
-        cls = all_channels[name]
+    for name in sorted(all_plugins):
+        cls = all_plugins[name]
         source = "builtin" if name in builtin_names else "plugin"
-        section = getattr(config.channels, name, None)
+        section = getattr(config.plugins, name, None)
         if section is None:
             enabled = False
         elif isinstance(section, dict):
@@ -1431,6 +1473,65 @@ def plugins_list():
         )
 
     console.print(table)
+
+
+def _set_plugin_enabled(
+    name: str,
+    enabled: bool,
+    config_path: Path | None = None,
+) -> None:
+    """Enable or disable a plugin by name and persist to config."""
+    import json
+
+    from nanobot.config.loader import get_config_path, load_config, save_config, set_config_path
+    from nanobot.plugins.registry import discover_all_plugins
+
+    all_plugins = discover_all_plugins()
+    if name not in all_plugins:
+        console.print(f"[red]Unknown plugin: {name}[/red]")
+        available = ", ".join(sorted(all_plugins.keys()))
+        console.print(f"  Available: {available}")
+        raise typer.Exit(1)
+
+    resolved = config_path or get_config_path()
+    set_config_path(resolved)
+    config = load_config(resolved)
+
+    section = getattr(config.plugins, name, None)
+    if section is None:
+        section = {}
+    elif not isinstance(section, dict):
+        section = section.model_dump() if hasattr(section, "model_dump") else dict(section)
+
+    section["enabled"] = enabled
+
+    raw = json.loads(resolved.read_text(encoding="utf-8"))
+    plugins_raw = raw.setdefault("plugins", {})
+    plugins_raw[name] = section
+    resolved.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    state = "enabled" if enabled else "disabled"
+    console.print(f"[green]✓[/green] Plugin '{name}' {state}")
+
+
+@plugins_app.command("enable")
+def plugins_enable(
+    name: str = typer.Argument(..., help="Plugin name"),
+    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Enable a plugin by name."""
+    resolved = Path(config_path).expanduser().resolve() if config_path else None
+    _set_plugin_enabled(name, True, resolved)
+
+
+@plugins_app.command("disable")
+def plugins_disable(
+    name: str = typer.Argument(..., help="Plugin name"),
+    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Disable a plugin by name."""
+    resolved = Path(config_path).expanduser().resolve() if config_path else None
+    _set_plugin_enabled(name, False, resolved)
 
 
 # ============================================================================

@@ -50,6 +50,9 @@ class AgentHook:
     async def after_iteration(self, context: AgentHookContext) -> None:
         pass
 
+    async def before_model_call(self, context: AgentHookContext) -> list[dict[str, Any]] | None:
+        return None
+
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return content
 
@@ -96,6 +99,15 @@ class CompositeHook(AgentHook):
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("after_iteration", context)
+
+    async def before_model_call(self, context: AgentHookContext) -> list[dict[str, Any]] | None:
+        result = None
+        for h in self._hooks:
+            r = await h.before_model_call(context)
+            if r is not None:
+                result = r
+                context.messages = r
+        return result
 
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         for h in self._hooks:
