@@ -100,6 +100,10 @@ class SkillManageTool(Tool):
     def __init__(self, skills_loader: SkillsLoader):
         self._loader = skills_loader
 
+    @classmethod
+    def create(cls, ctx: Any) -> "SkillManageTool":
+        return cls(skills_loader=ctx.skills_loader)
+
     @property
     def name(self) -> str:
         return "skill_manage"

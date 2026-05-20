@@ -128,6 +128,41 @@ All frames are JSON text. Each message has an `event` field.
 }
 ```
 
+**`reasoning_delta`** — incremental model reasoning / thinking chunk for the active assistant turn. Mirrors `delta` but targets the reasoning bubble above the answer rather than the answer body:
+
+```json
+{
+  "event": "reasoning_delta",
+  "chat_id": "uuid-v4",
+  "text": "Let me decompose ",
+  "stream_id": "r1"
+}
+```
+
+**`reasoning_end`** — close marker for the active reasoning stream. WebUI uses this to lock the in-place bubble and switch from the shimmer header to a static collapsed state:
+
+```json
+{
+  "event": "reasoning_end",
+  "chat_id": "uuid-v4",
+  "stream_id": "r1"
+}
+```
+
+Reasoning frames only flow when the channel's `showReasoning` is `true` (default) and the model returns reasoning content (DeepSeek-R1 / Kimi / MiMo / OpenAI reasoning models, Anthropic extended thinking, or inline `<think>` / `<thought>` tags). Models without reasoning produce zero `reasoning_delta` frames.
+
+**`runtime_model_updated`** — broadcast when the gateway runtime model changes, for example after `/model <preset>`:
+
+```json
+{
+  "event": "runtime_model_updated",
+  "model_name": "openai/gpt-4.1-mini",
+  "model_preset": "fast"
+}
+```
+
+`model_preset` is omitted when no named preset is active. WebUI clients use this event to keep the displayed model badge in sync across slash commands, config reloads, and settings changes.
+
 **`attached`** — confirmation for `new_chat` / `attach` inbound envelopes (see [Multi-chat multiplexing](#multi-chat-multiplexing)):
 
 ```json
@@ -176,7 +211,7 @@ All fields go under `channels.websocket` in `config.json`.
 | `host` | string | `"127.0.0.1"` | Bind address. Use `"0.0.0.0"` to accept external connections. |
 | `port` | int | `8765` | Listen port. |
 | `path` | string | `"/"` | WebSocket upgrade path. Trailing slashes are normalized (root `/` is preserved). |
-| `maxMessageBytes` | int | `1048576` | Maximum inbound message size in bytes (1 KB – 16 MB). |
+| `maxMessageBytes` | int | `37748736` | Maximum inbound message size in bytes (1 KB – 40 MB). Default (36 MB) is sized to accept up to 4 base64-encoded image attachments at 8 MB each; lower it if the channel only carries text. |
 
 ### Authentication
 

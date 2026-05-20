@@ -20,7 +20,7 @@ class FakeSocket {
   onopen: (() => void) | null = null;
   onmessage: ((ev: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((ev?: { code?: number }) => void) | null = null;
 
   constructor(url: string) {
     this.url = url;
@@ -34,6 +34,13 @@ class FakeSocket {
   close() {
     this.readyState = FakeSocket.CLOSED;
     this.onclose?.();
+  }
+
+  /** Simulate a server-initiated drop with a specific wire-level close code
+   * (e.g. ``1009`` for Message Too Big). */
+  fakeCloseWithCode(code: number) {
+    this.readyState = FakeSocket.CLOSED;
+    this.onclose?.({ code });
   }
 
   fakeOpen() {
@@ -82,6 +89,191 @@ describe("NanobotClient", () => {
     });
   });
 
+  it("buffers chat events while no chat handler is registered and replays on subscribe", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    // Nobody listening yet — deltas must not be dropped (user switched away).
+    lastSocket().fakeMessage({ event: "delta", chat_id: "chat-queue", text: "a" });
+    lastSocket().fakeMessage({ event: "delta", chat_id: "chat-queue", text: "b" });
+    const handler = vi.fn();
+    client.onChat("chat-queue", handler);
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(handler.mock.calls[0][0]).toMatchObject({ event: "delta", text: "a" });
+    expect(handler.mock.calls[1][0]).toMatchObject({ event: "delta", text: "b" });
+    lastSocket().fakeMessage({ event: "delta", chat_id: "chat-queue", text: "c" });
+    expect(handler).toHaveBeenCalledTimes(3);
+  });
+
+  it("records goal_status run strip without an onChat subscriber", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeMessage({
+      event: "goal_status",
+      chat_id: "chat-strip",
+      status: "running",
+      started_at: 12_345,
+    });
+    expect(client.getRunStartedAt("chat-strip")).toBe(12_345);
+    lastSocket().fakeMessage({
+      event: "goal_status",
+      chat_id: "chat-strip",
+      status: "idle",
+    });
+    expect(client.getRunStartedAt("chat-strip")).toBeNull();
+  });
+
+  it("notifies run status subscribers and replays running chats", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const handler = vi.fn();
+    client.onRunStatus(handler);
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeMessage({
+      event: "goal_status",
+      chat_id: "chat-status",
+      status: "running",
+      started_at: 12_345,
+    });
+    expect(handler).toHaveBeenCalledWith("chat-status", 12_345);
+
+    const lateHandler = vi.fn();
+    client.onRunStatus(lateHandler);
+    expect(lateHandler).toHaveBeenCalledWith("chat-status", 12_345);
+
+    lastSocket().fakeMessage({
+      event: "goal_status",
+      chat_id: "chat-status",
+      status: "idle",
+    });
+    expect(handler).toHaveBeenCalledWith("chat-status", null);
+    expect(lateHandler).toHaveBeenCalledWith("chat-status", null);
+  });
+
+  it("records goal_state per chat_id without an onChat subscriber", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeMessage({
+      event: "goal_state",
+      chat_id: "chat-goal-a",
+      goal_state: { active: true, ui_summary: "Docs" },
+    });
+    lastSocket().fakeMessage({
+      event: "goal_state",
+      chat_id: "chat-goal-b",
+      goal_state: { active: true, objective: "Ship API" },
+    });
+    expect(client.getGoalState("chat-goal-a")).toEqual({ active: true, ui_summary: "Docs" });
+    expect(client.getGoalState("chat-goal-b")).toEqual({
+      active: true,
+      objective: "Ship API",
+    });
+    lastSocket().fakeMessage({
+      event: "goal_state",
+      chat_id: "chat-goal-a",
+      goal_state: { active: false },
+    });
+    expect(client.getGoalState("chat-goal-a")).toEqual({ active: false });
+  });
+
+  it("records goal_state from turn_end payload when present", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeMessage({
+      event: "turn_end",
+      chat_id: "chat-te",
+      goal_state: { active: true, objective: "Long task" },
+    });
+    expect(client.getGoalState("chat-te")).toEqual({ active: true, objective: "Long task" });
+  });
+
+  it("buffers after unsubscribe until the chat is subscribed again", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const h1 = vi.fn();
+    const unsub = client.onChat("chat-rejoin", h1);
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeMessage({ event: "delta", chat_id: "chat-rejoin", text: "live" });
+    expect(h1).toHaveBeenCalledTimes(1);
+    unsub();
+    lastSocket().fakeMessage({ event: "delta", chat_id: "chat-rejoin", text: "queued" });
+    expect(h1).toHaveBeenCalledTimes(1);
+    const h2 = vi.fn();
+    client.onChat("chat-rejoin", h2);
+    expect(h2).toHaveBeenCalledTimes(1);
+    expect(h2.mock.calls[0][0]).toMatchObject({ event: "delta", text: "queued" });
+  });
+
+  it("dispatches runtime model updates globally", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const handler = vi.fn();
+    client.onRuntimeModelUpdate(handler);
+    client.connect();
+    lastSocket().fakeOpen();
+
+    lastSocket().fakeMessage({
+      event: "runtime_model_updated",
+      model_name: "openai/gpt-4.1",
+      model_preset: "fast",
+    });
+
+    expect(handler).toHaveBeenCalledWith("openai/gpt-4.1", "fast");
+  });
+
+  it("dispatches session updates globally", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const globalHandler = vi.fn();
+    const chatHandler = vi.fn();
+    client.onSessionUpdate(globalHandler);
+    client.onChat("chat-title", chatHandler);
+    client.connect();
+    lastSocket().fakeOpen();
+
+    lastSocket().fakeMessage({
+      event: "session_updated",
+      chat_id: "chat-title",
+      scope: "metadata",
+    });
+
+    expect(globalHandler).toHaveBeenCalledWith("chat-title", "metadata");
+    expect(chatHandler).not.toHaveBeenCalled();
+  });
+
   it("resolves newChat() via the server-assigned chat_id", async () => {
     const client = new NanobotClient({
       url: "ws://test",
@@ -109,7 +301,34 @@ describe("NanobotClient", () => {
     // Attach is sent first because sendMessage adds to knownChats, which
     // handleOpen re-attaches; then the queued message follows.
     expect(lastSocket().sent).toContain(
-      JSON.stringify({ type: "message", chat_id: "chat-x", content: "hello" }),
+      JSON.stringify({ type: "message", chat_id: "chat-x", content: "hello", webui: true }),
+    );
+  });
+
+  it("includes image generation options in outbound messages", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+
+    client.sendMessage(
+      "chat-img",
+      "draw a banner",
+      undefined,
+      { imageGeneration: { enabled: true, aspect_ratio: "16:9" } },
+    );
+
+    expect(lastSocket().sent).toContain(
+      JSON.stringify({
+        type: "message",
+        chat_id: "chat-img",
+        content: "draw a banner",
+        image_generation: { enabled: true, aspect_ratio: "16:9" },
+        webui: true,
+      }),
     );
   });
 
@@ -170,6 +389,97 @@ describe("NanobotClient", () => {
     // "reconnecting" must never appear after an intentional close.
     expect(seen).not.toContain("reconnecting");
     expect(seen.at(-1)).toBe("closed");
+  });
+
+  it("passes media through into the message envelope", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    client.sendMessage("chat-x", "look", [
+      { data_url: "data:image/png;base64,AAAA", name: "shot.png" },
+    ]);
+    const lastFrame = JSON.parse(lastSocket().sent.at(-1) as string);
+    expect(lastFrame).toEqual({
+      type: "message",
+      chat_id: "chat-x",
+      content: "look",
+      media: [{ data_url: "data:image/png;base64,AAAA", name: "shot.png" }],
+      webui: true,
+    });
+  });
+
+  it("omits media from the envelope when no images are attached", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    client.connect();
+    lastSocket().fakeOpen();
+    client.sendMessage("chat-x", "hello");
+    const lastFrame = JSON.parse(lastSocket().sent.at(-1) as string);
+    expect(lastFrame).not.toHaveProperty("media");
+    expect(lastFrame).toEqual({
+      type: "message",
+      chat_id: "chat-x",
+      content: "hello",
+      webui: true,
+    });
+  });
+
+  it("emits a message_too_big error when the socket closes with code 1009", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const errors: Array<{ kind: string }> = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    lastSocket().fakeOpen();
+    // Server rejected an outbound frame as too large.
+    lastSocket().fakeCloseWithCode(1009);
+    expect(errors).toEqual([{ kind: "message_too_big" }]);
+  });
+
+  it("isolates throwing error handlers so reconnect bookkeeping still runs", async () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: true,
+      maxBackoffMs: 5,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    // First handler explodes; subsequent reconnect state must be untouched.
+    client.onError(() => {
+      throw new Error("subscriber blew up");
+    });
+    const seenStatuses: string[] = [];
+    client.onStatus((s) => seenStatuses.push(s));
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().fakeCloseWithCode(1009);
+    // Despite the throwing handler, the client must still schedule a reconnect.
+    expect(seenStatuses).toContain("reconnecting");
+    await vi.advanceTimersByTimeAsync(20);
+    expect(FakeSocket.instances.length).toBeGreaterThan(1);
+  });
+
+  it("does not emit a stream error on a vanilla socket close", () => {
+    const client = new NanobotClient({
+      url: "ws://test",
+      reconnect: false,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket,
+    });
+    const errors: Array<{ kind: string }> = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    lastSocket().fakeOpen();
+    lastSocket().close();
+    expect(errors).toEqual([]);
   });
 
   it("surfaces 'reconnecting' only on an unexpected drop", async () => {
