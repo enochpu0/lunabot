@@ -948,7 +948,7 @@ class WeixinChannel(BaseChannel):
             await self._stop_typing(msg.chat_id, clear_remote=True)
 
         content = msg.content.strip()
-        ctx_token = self._context_tokens.get(msg.chat_id, "")
+        ctx_token = self._context_tokens.get(msg.chat_id, "") or self._context_tokens.get(f"{msg.chat_id}@im.wechat", "")
         if not ctx_token:
             raise RuntimeError(
                 f"WeChat context_token missing for chat_id={msg.chat_id}, cannot send"
