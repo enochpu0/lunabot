@@ -49,6 +49,7 @@ class ProviderSpec:
 
     # gateway behavior
     strip_model_prefix: bool = False  # strip "provider/" before sending to gateway
+    strip_model_prefixes: tuple[str, ...] = ()  # strip only when the first model segment matches
     supports_max_completion_tokens: bool = False
 
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
@@ -59,6 +60,9 @@ class ProviderSpec:
 
     # Direct providers skip API-key validation (user supplies everything)
     is_direct: bool = False
+
+    # Provider is listed for shared credentials but cannot serve chat completions.
+    is_transcription_only: bool = False
 
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
@@ -71,10 +75,38 @@ class ProviderSpec:
     # "reasoning_split" — {"reasoning_split": true/false}  (MiniMax)
     thinking_style: str = ""
 
+    # Gateway-native reasoning control to pair with model-level thinking styles.
+    # "reasoning_effort" — {"reasoning": {"effort": <none|minimal|...>}}
+    #                      (OpenRouter)
+    gateway_reasoning_style: str = ""
+
     # When True, treat the "reasoning" response field as formal content
     # when "content" is empty.  Only set this for providers (e.g. StepFun)
     # whose API returns the actual answer in "reasoning" instead of "content".
     reasoning_as_content: bool = False
+
+    # Map user-supplied reasoning_effort (OpenAI vocab: minimal/low/medium/high)
+    # to the value this provider accepts on the wire. Set when the provider's
+    # accepted set differs from OpenAI's. An empty mapped value omits the kwarg.
+    # Mistral: only "high"/"none" — low/minimal map to "none", medium maps to "high".
+    reasoning_effort_remap: tuple[tuple[str, str], ...] = ()
+
+    # Models whose API rejects the reasoning_effort kwarg because reasoning is
+    # implicit (Magistral always reasons; sending the kwarg returns HTTP 400).
+    # Substring match against the wire model name (lowercased).
+    implicit_reasoning_models: tuple[str, ...] = ()
+
+    # When the model returns content as a list of {"type":"thinking",...} +
+    # {"type":"text",...} blocks, extract the thinking text into
+    # reasoning_content. Mistral's Magistral / reasoning-enabled responses use
+    # this shape.
+    extract_thinking_blocks: bool = False
+
+    # Strip ``reasoning_content`` from assistant history messages before
+    # sending. Mistral validates its request schema strictly and 400s on
+    # any extra fields; other providers (DeepSeek) require this key on the
+    # wire to keep thinking-mode history intact.
+    strip_history_reasoning_content: bool = False
 
     @property
     def label(self) -> str:
@@ -142,6 +174,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="openrouter",
         default_api_base="https://openrouter.ai/api/v1",
         supports_prompt_caching=True,
+        gateway_reasoning_style="reasoning_effort",
     ),
     # Hugging Face Inference Providers: OpenAI-compatible router for chat models.
     ProviderSpec(
@@ -191,6 +224,18 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_gateway=True,
         detect_by_base_keyword="siliconflow",
         default_api_base="https://api.siliconflow.cn/v1",
+    ),
+
+    # Novita AI: OpenAI-compatible gateway for hosted model APIs.
+    ProviderSpec(
+        name="novita",
+        keywords=("novita",),
+        env_key="NOVITA_API_KEY",
+        display_name="Novita AI",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="novita",
+        default_api_base="https://api.novita.ai/openai",
     ),
 
     # VolcEngine (火山引擎): OpenAI-compatible gateway, pay-per-use models
@@ -330,7 +375,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
         thinking_style="enable_thinking",
     ),
-    # Moonshot (月之暗面): Kimi K2.5 / K2.6 enforce temperature >= 1.0.
+    # Moonshot (月之暗面): Kimi K2.5+ enforce temperature >= 1.0.
     ProviderSpec(
         name="moonshot",
         keywords=("moonshot", "kimi"),
@@ -341,6 +386,9 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(
             ("kimi-k2.5", {"temperature": 1.0}),
             ("kimi-k2.6", {"temperature": 1.0}),
+            ("kimi-k2.7", {"temperature": 1.0}),
+            ("kimi-k2.7-code", {"temperature": 1.0}),
+            ("kimi-k2.7-code-highspeed", {"temperature": 1.0}),
         ),
     ),
     # MiniMax: OpenAI-compatible API
@@ -362,14 +410,30 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="anthropic",
         default_api_base="https://api.minimax.io/anthropic",
     ),
-    # Mistral AI: OpenAI-compatible API
+    # Mistral AI: OpenAI-compatible API.
+    # Reasoning quirks:
+    #   * mistral-medium-3-5 / mistral-vibe-cli-* accept reasoning_effort but
+    #     only "high" or "none" — low/medium/minimal must be remapped.
+    #   * Magistral-* models reason implicitly and reject the kwarg entirely.
+    #   * Reasoning responses return content as a list of thinking + text
+    #     blocks; thinking text gets extracted into reasoning_content.
     ProviderSpec(
         name="mistral",
-        keywords=("mistral",),
+        keywords=("mistral", "magistral", "ministral", "codestral", "devstral"),
         env_key="MISTRAL_API_KEY",
         display_name="Mistral",
         backend="openai_compat",
         default_api_base="https://api.mistral.ai/v1",
+        reasoning_effort_remap=(
+            ("minimal", "none"),
+            ("low", "none"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("none", "none"),
+        ),
+        implicit_reasoning_models=("magistral",),
+        extract_thinking_blocks=True,
+        strip_history_reasoning_content=True,
     ),
     # Step Fun (阶跃星辰): OpenAI-compatible API
     ProviderSpec(
@@ -489,6 +553,17 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         default_api_base="https://api.groq.com/openai/v1",
     ),
+    # AssemblyAI: voice transcription only. It appears in provider settings so
+    # users can manage credentials, but WebUI excludes it from chat model pickers.
+    ProviderSpec(
+        name="assemblyai",
+        keywords=("assemblyai",),
+        env_key="ASSEMBLYAI_API_KEY",
+        display_name="AssemblyAI",
+        backend="openai_compat",
+        default_api_base="https://api.assemblyai.com/v2",
+        is_transcription_only=True,
+    ),
     # Qianfan (百度千帆): OpenAI-compatible API
     ProviderSpec(
         name="qianfan",
@@ -513,3 +588,18 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == normalized:
             return spec
     return None
+
+
+def create_dynamic_spec(name: str) -> ProviderSpec:
+    """Create a dynamic ProviderSpec for custom user-defined providers."""
+    normalized = to_snake(name.replace("-", "_"))
+    strip_prefixes = tuple(dict.fromkeys((name, normalized)))
+    return ProviderSpec(
+        name=normalized,
+        keywords=(),
+        env_key="",
+        display_name=name.title(),
+        backend="openai_compat",
+        is_direct=True,
+        strip_model_prefixes=strip_prefixes,
+    )

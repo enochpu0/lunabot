@@ -218,6 +218,7 @@ _TOOL_RESULT_PREVIEW_CHARS = 1200
 _TOOL_RESULTS_DIR = ".nanobot/tool-results"
 _TOOL_RESULT_RETENTION_SECS = 7 * 24 * 60 * 60
 _TOOL_RESULT_MAX_BUCKETS = 32
+_TRUNCATED_SUFFIX = "\n... (truncated)"
 
 
 def safe_filename(name: str) -> str:
@@ -234,7 +235,65 @@ def truncate_text(text: str, max_chars: int) -> str:
     """Truncate text with a stable suffix."""
     if max_chars <= 0 or len(text) <= max_chars:
         return text
-    return text[:max_chars] + "\n... (truncated)"
+    return text[:max_chars] + _TRUNCATED_SUFFIX
+
+
+def truncate_text_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to a token budget with a stable suffix.
+
+    Unlike :func:`truncate_text`, this measures actual tokens, so the cap holds
+    regardless of language or content (CJK and code cost more tokens per char).
+    Falls back to a char-based estimate (~4 chars/token) if tiktoken is
+    unavailable.
+    """
+    if max_tokens <= 0:
+        return text
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")
+        tokens = enc.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        suffix_tokens = enc.encode(_TRUNCATED_SUFFIX)
+        body_budget = max_tokens - len(suffix_tokens)
+        if body_budget <= 0:
+            return enc.decode(tokens[:max_tokens])
+        for candidate_budget in range(body_budget, -1, -1):
+            result = enc.decode(tokens[:candidate_budget]) + _TRUNCATED_SUFFIX
+            if len(enc.encode(result)) <= max_tokens:
+                return result
+        return enc.decode(tokens[:max_tokens])
+    except Exception:
+        max_chars = max_tokens * 4
+        suffix_chars = len(_TRUNCATED_SUFFIX)
+        if max_chars <= suffix_chars:
+            return text[:max_chars]
+        return truncate_text(text, max_chars - suffix_chars)
+
+
+def recent_message_start_index(
+    messages: list[dict[str, Any]],
+    max_messages: int,
+    *,
+    extend_to_user: bool = False,
+) -> int:
+    """Return the start index for a recent replay window."""
+    if max_messages <= 0:
+        return len(messages)
+    start_idx = max(0, len(messages) - max_messages)
+    if not extend_to_user or len(messages) <= max_messages:
+        return start_idx
+    if any(messages[i].get("role") == "user" for i in range(start_idx, len(messages))):
+        return start_idx
+
+    recovered_user = next(
+        (i for i in range(start_idx - 1, -1, -1) if messages[i].get("role") == "user"),
+        None,
+    )
+    if recovered_user is None:
+        return start_idx
+    if recovered_user > 0 and messages[recovered_user - 1].get("_channel_delivery"):
+        return recovered_user - 1
+    return recovered_user
 
 
 def find_legal_message_start(messages: list[dict[str, Any]]) -> int:
@@ -576,7 +635,7 @@ def build_status_content(
 
 
 def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
-    """Sync bundled templates to workspace. Only creates missing files."""
+    """Sync bundled templates to workspace. Creates missing files without overwriting user files."""
     from importlib.resources import files as pkg_files
 
     try:
@@ -589,10 +648,11 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
     added: list[str] = []
 
     def _write(src, dest: Path):
+        content = src.read_text(encoding="utf-8") if src else ""
         if dest.exists():
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(src.read_text(encoding="utf-8") if src else "", encoding="utf-8")
+        dest.write_text(content, encoding="utf-8")
         added.append(str(dest.relative_to(workspace)))
 
     for item in tpl.iterdir():
@@ -625,3 +685,14 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
         logger.exception("Failed to initialize git store for {}", workspace)
 
     return added
+
+
+def load_bundled_template(template_name: str) -> str | None:
+    """Read a bundled template file from the nanobot package."""
+    from importlib.resources import files as pkg_files
+
+    with suppress(Exception):
+        tpl = pkg_files("nanobot") / "templates" / template_name
+        if tpl.is_file():
+            return tpl.read_text(encoding="utf-8")
+    return None

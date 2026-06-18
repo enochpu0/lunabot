@@ -98,3 +98,5 @@ tmp/
 temp/
 *.tmp
 exp/
+.playwright-mcp/
+bridge/node_modules/

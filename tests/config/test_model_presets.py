@@ -1,3 +1,7 @@
+import warnings
+
+import pytest
+
 from nanobot.config.schema import Config
 
 
@@ -10,6 +14,125 @@ def test_resolve_preset_returns_defaults_when_no_preset() -> None:
     assert resolved.context_window_tokens == config.agents.defaults.context_window_tokens
     assert resolved.temperature == config.agents.defaults.temperature
     assert resolved.reasoning_effort == config.agents.defaults.reasoning_effort
+
+
+def test_provider_api_type_accepts_exact_values_only() -> None:
+    config = Config.model_validate({
+        "providers": {
+            "openai": {
+                "apiKey": "sk-test",
+                "apiType": "responses",
+            }
+        }
+    })
+    assert config.providers.openai.api_type == "responses"
+
+    with pytest.raises(ValueError):
+        Config.model_validate({
+            "providers": {
+                "openai": {
+                    "apiKey": "sk-test",
+                    "apiType": "response",
+                }
+            }
+        })
+
+
+def test_provider_api_type_is_openai_only() -> None:
+    with pytest.raises(ValueError, match="only supported"):
+        Config.model_validate({
+            "providers": {
+                "custom": {
+                    "apiBase": "https://example.test/v1",
+                    "apiType": "responses",
+                }
+            }
+        })
+
+    with pytest.raises(ValueError, match="only supported"):
+        Config.model_validate({
+            "providers": {
+                "my-company-api": {
+                    "apiBase": "https://example.test/v1",
+                    "apiType": "responses",
+                }
+            }
+        })
+
+
+@pytest.mark.parametrize("provider_name", ["openai-codex", "github-copilot", "lm-studio"])
+def test_dynamic_custom_provider_rejects_builtin_provider_aliases(provider_name: str) -> None:
+    with pytest.raises(ValueError, match="conflicts with built-in provider"):
+        Config.model_validate({
+            "providers": {
+                provider_name: {
+                    "apiBase": "https://example.test/v1",
+                }
+            }
+        })
+
+
+def test_custom_provider_fallback_uses_model_extra_without_pydantic_warnings() -> None:
+    config = Config.model_validate({
+        "agents": {
+            "defaults": {
+                "model": "unmatched-model",
+            }
+        },
+        "providers": {
+            "my-company-api": {
+                "apiBase": "https://example.test/v1",
+            }
+        },
+    })
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert config.get_provider_name() == "my-company-api"
+
+
+def test_dynamic_custom_provider_prefix_matches_camel_case_key() -> None:
+    config = Config.model_validate({
+        "agents": {
+            "defaults": {
+                "provider": "auto",
+                "model": "companyProxy/gpt-4o-mini",
+            }
+        },
+        "providers": {
+            "otherProxy": {
+                "apiBase": "https://other.example.test/v1",
+            },
+            "companyProxy": {
+                "apiBase": "https://company.example.test/v1",
+            },
+        },
+    })
+
+    assert config.get_provider_name() == "companyProxy"
+    assert config.get_api_base() == "https://company.example.test/v1"
+
+
+def test_dynamic_custom_provider_prefix_does_not_fall_through_when_base_missing() -> None:
+    config = Config.model_validate({
+        "agents": {
+            "defaults": {
+                "provider": "auto",
+                "model": "companyProxy/gpt-4o-mini",
+            }
+        },
+        "providers": {
+            "otherProxy": {
+                "apiBase": "https://other.example.test/v1",
+            },
+            "companyProxy": {
+                "apiKey": "sk-company",
+            },
+        },
+    })
+
+    assert config.get_provider_name() == "companyProxy"
+    assert config.get_api_base() is None
 
 
 def test_legacy_defaults_config_without_presets_still_resolves() -> None:
@@ -192,3 +315,35 @@ def test_match_provider_uses_preset_provider_when_forced() -> None:
     })
     name = config.get_provider_name()
     assert name == "anthropic"
+
+
+def test_match_provider_routes_forced_novita_model_api_models() -> None:
+    config = Config.model_validate({
+        "providers": {
+            "novita": {"apiKey": "sk-test"},
+        },
+        "agents": {
+            "defaults": {
+                "model": "deepseek-v4-pro",
+                "provider": "novita",
+            }
+        },
+    })
+
+    assert config.get_provider_name() == "novita"
+    assert config.get_api_base() == "https://api.novita.ai/openai"
+
+
+def test_transcription_only_provider_is_not_chat_fallback() -> None:
+    config = Config.model_validate({
+        "providers": {
+            "assemblyai": {"apiKey": "aai-test"},
+        },
+        "agents": {
+            "defaults": {
+                "model": "assemblyai/universal-3-pro",
+            }
+        },
+    })
+
+    assert config.get_provider_name() is None

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.subagent import SubagentStatus
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.context import ContextAware, RequestContext
 from nanobot.agent.tools.runtime_state import RuntimeState
-from nanobot.config.schema import Base
+from nanobot.config_base import Base
+
+if TYPE_CHECKING:
+    from nanobot.agent.subagent import SubagentStatus
 
 
 class MyToolConfig(Base):
@@ -31,6 +33,12 @@ def _has_real_attr(obj: Any, key: str) -> bool:
         if key in cls.__dict__:
             return True
     return False
+
+
+def _is_subagent_status(value: Any) -> bool:
+    from nanobot.agent.subagent import SubagentStatus
+
+    return isinstance(value, SubagentStatus)
 
 
 class MyTool(Tool, ContextAware):
@@ -68,6 +76,7 @@ class MyTool(Tool, ContextAware):
         "_current_iteration",  # updated by runner only
         "exec_config",  # inspect allowed (e.g. check sandbox), modify blocked
         "web_config",  # inspect allowed (e.g. check enable), modify blocked
+        "workspace_sandbox",  # read-only view of workspace enforcement level
     })
 
     _DENIED_ATTRS = frozenset({
@@ -139,6 +148,7 @@ class MyTool(Tool, ContextAware):
             "\n"
             "When to use:\n"
             "- User asks about your model, settings, or token usage → check that key.\n"
+            "- User asks to switch to a named model preset → set model_preset to that preset name.\n"
             "- A tool fails or behaves unexpectedly → check the related config to diagnose.\n"
             "- User asks you to remember a preference for this session → set to store it in your scratchpad.\n"
             "- About to start a large task → check context_window_tokens and max_iterations first."
@@ -166,9 +176,9 @@ class MyTool(Tool, ContextAware):
                 "key": {
                     "type": "string",
                     "description": "Dot-path for check/set. Examples: 'max_iterations', 'workspace', 'provider_retry_mode'. "
-                    "For check without key, shows all config values.",
+                    "Use 'model_preset' to switch named model presets. For check without key, shows all config values.",
                 },
-                "value": {"description": "New value (for set). Type must match target (int for max_iterations/context_window_tokens, str for model)."},
+                "value": {"description": "New value (for set). Type must match target (int for max_iterations/context_window_tokens, str for model/model_preset)."},
             },
             "required": ["action"],
         }
@@ -214,7 +224,7 @@ class MyTool(Tool, ContextAware):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _format_status(st: SubagentStatus, indent: str = "  ") -> str:
+    def _format_status(st: "SubagentStatus", indent: str = "  ") -> str:
         elapsed = time.monotonic() - st.started_at
         tool_summary = ", ".join(
             f"{e.get('name', '?')}({e.get('status', '?')})" for e in st.tool_events[-5:]
@@ -232,14 +242,14 @@ class MyTool(Tool, ContextAware):
 
     @staticmethod
     def _format_value(val: Any, key: str = "") -> str:
-        if isinstance(val, SubagentStatus):
+        if _is_subagent_status(val):
             header = f"Subagent [{val.task_id}] '{val.label}'"
             detail = MyTool._format_status(val, "  ")
             return f"{header}\n  task: {val.task_description}\n{detail}"
         # SubagentManager: delegate to its _task_statuses dict
         if hasattr(val, "_task_statuses") and isinstance(val._task_statuses, dict):
             return MyTool._format_value(val._task_statuses, key)
-        if isinstance(val, dict) and val and isinstance(next(iter(val.values())), SubagentStatus):
+        if isinstance(val, dict) and val and _is_subagent_status(next(iter(val.values()))):
             prefix = f"{key}: " if key else ""
             lines = [f"{prefix}{len(val)} subagent(s):"]
             for tid, st in val.items():
@@ -349,7 +359,7 @@ class MyTool(Tool, ContextAware):
             parts.append(self._format_value(getattr(state, k, None), k))
         parts.append(self._format_value(state.model_preset, "model_preset"))
         # Other useful top-level keys shown in description
-        for k in ("workspace", "provider_retry_mode", "max_tool_result_chars", "_current_iteration", "web_config", "exec_config", "subagents"):
+        for k in ("workspace", "provider_retry_mode", "max_tool_result_chars", "_current_iteration", "web_config", "exec_config", "workspace_sandbox", "subagents"):
             if _has_real_attr(state, k):
                 parts.append(self._format_value(getattr(state, k, None), k))
         # Token usage
@@ -390,9 +400,23 @@ class MyTool(Tool, ContextAware):
                 setattr(parent, leaf, value)
             self._audit("modify", f"{key} = {value!r}")
             return f"Set {key} = {value!r}"
+        if key == "model_preset":
+            return self._modify_model_preset(value)
         if key in self.RESTRICTED:
             return self._modify_restricted(key, value)
         return self._modify_free(key, value)
+
+    def _modify_model_preset(self, value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return "Error: 'model_preset' must be a non-empty string"
+        name = value.strip()
+        result = self._modify_free("model_preset", name)
+        if result.startswith("Error:"):
+            return result if result.endswith((".", "!", "?")) else f"{result}."
+        return (
+            f"{result}; model is now {self._runtime_state.model!r}; "
+            f"context_window_tokens is now {self._runtime_state.context_window_tokens!r}"
+        )
 
     def _modify_restricted(self, key: str, value: Any) -> str:
         spec = self.RESTRICTED[key]
@@ -435,8 +459,9 @@ class MyTool(Tool, ContextAware):
             try:
                 setattr(self._runtime_state, key, value)
             except (ValueError, KeyError) as e:
-                self._audit("modify", f"REJECTED {key}: {e}")
-                return f"Error: {e}"
+                message = str(e.args[0] if isinstance(e, KeyError) and e.args else e).strip('"')
+                self._audit("modify", f"REJECTED {key}: {message}")
+                return f"Error: {message}"
             self._audit("modify", f"{key}: {old!r} -> {value!r}")
             return f"Set {key} = {value!r} (was {old!r})"
         if callable(value):
