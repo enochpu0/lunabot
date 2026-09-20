@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -39,6 +39,33 @@ vi.mock("react-syntax-highlighter/dist/esm/styles/prism/one-light", () => ({
 }));
 
 describe("CodeBlock", () => {
+  it("renders and copies a large code block in full without pagination", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const source = Array.from({ length: 1200 }, (_, i) => `const value${i} = ${i};`).join("\n");
+
+    try {
+      render(<CodeBlock code={source} language="typescript" showLineNumbers />);
+      expect((await screen.findByTestId("highlighted-code")).textContent).toBe(source);
+      expect(screen.getAllByRole("button")).toHaveLength(1);
+      await user.click(screen.getByRole("button", { name: "Copy code" }));
+      expect(writeText).toHaveBeenCalledWith(source);
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  it("renders long plain text with Unicode in full", () => {
+    const source = "x".repeat(23999) + "😀tail";
+    render(<CodeBlock code={source} highlight={false} />);
+    expect(screen.getByTestId("plain-code-fallback").textContent).toBe(source);
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+  });
+
   it("renders plain code without mounting the highlighter when highlighting is disabled", () => {
     render(
       <ThemeProvider theme="dark">
@@ -48,8 +75,20 @@ describe("CodeBlock", () => {
 
     expect(screen.queryByTestId("highlighted-code")).not.toBeInTheDocument();
     expect(screen.getByText("const value = 1;")).toBeInTheDocument();
-    expect(screen.getByText("ts")).toBeInTheDocument();
+    expect(screen.queryByText("ts")).not.toBeInTheDocument();
     expect(screen.getByTestId("plain-code-fallback")).toHaveClass("text-foreground/90");
+    expect(screen.getByTestId("plain-code-fallback")).toHaveClass("bg-transparent");
+    expect(screen.getByTestId("plain-code-fallback")).toHaveClass("py-4", "pl-5", "pr-14");
+
+    const container = screen.getByTestId("plain-code-fallback").closest(".not-prose");
+    expect(container).toHaveClass("relative", "rounded-floating", "bg-secondary/70");
+    expect(container).not.toHaveClass("border");
+    expect(container).toHaveAttribute("data-language", "ts");
+
+    const copyButton = screen.getByRole("button", { name: "Copy code" });
+    expect(copyButton.parentElement).toBe(container);
+    expect(copyButton).toHaveClass("absolute", "h-8", "w-8", "rounded-full");
+    expect(copyButton).toHaveTextContent("");
   });
 
   it("can render without chat-style chrome for file previews", () => {
@@ -88,6 +127,21 @@ describe("CodeBlock", () => {
     expect(screen.getByText("const value = 1;")).toBeInTheDocument();
   });
 
+  it("normalizes file language aliases before loading Prism", async () => {
+    render(
+      <ThemeProvider theme="light">
+        <CodeBlock language="html" code="<main />" />
+      </ThemeProvider>,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("highlighted-code")).toHaveAttribute("data-language", "markup");
+  });
+
   it("renders ANSI output without mounting the syntax highlighter", () => {
     render(
       <ThemeProvider theme="dark">
@@ -100,8 +154,11 @@ describe("CodeBlock", () => {
 
     expect(screen.queryByTestId("highlighted-code")).not.toBeInTheDocument();
     expect(screen.getByTestId("ansi-code")).toBeInTheDocument();
-    expect(screen.getByTestId("ansi-code").closest(".not-prose")).toBeTruthy();
-    expect(screen.getByText("ansi")).toBeInTheDocument();
+    expect(screen.getByTestId("ansi-code").closest(".not-prose")).toHaveAttribute(
+      "data-language",
+      "ansi",
+    );
+    expect(screen.queryByText("ansi")).not.toBeInTheDocument();
     expect(screen.getByText("PASS")).toHaveStyle({ color: "#0dbc79" });
     expect(screen.getByText("<script>alert(1)</script>")).toBeInTheDocument();
     expect(document.querySelector("script")).toBeNull();
@@ -143,6 +200,35 @@ describe("CodeBlock", () => {
       expect(writeText).toHaveBeenCalledWith("PASS");
     } finally {
       Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  it("copies with the textarea fallback when Clipboard API is unavailable", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+
+    try {
+      render(
+        <ThemeProvider theme="dark">
+          <CodeBlock language="ts" code="const value = 1;" highlight={false} />
+        </ThemeProvider>,
+      );
+
+      await user.click(screen.getByRole("button", { name: /copy/i }));
+
+      await waitFor(() => expect(execCommand).toHaveBeenCalledWith("copy"));
+      expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+      Reflect.deleteProperty(document, "execCommand");
     }
   });
 

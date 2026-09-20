@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from nanobot.bus.events import InboundMessage
-from nanobot.session.goal_state import GOAL_STATE_KEY
+from nanobot.session.goal_state import (
+    GOAL_STATE_KEY,
+    explicit_goal_requested,
+    sustained_goal_turn,
+)
 from nanobot.session.turn_continuation import (
     INTERNAL_CONTINUATION_KIND_META,
     INTERNAL_CONTINUATION_META,
@@ -20,6 +24,7 @@ from nanobot.session.turn_continuation import (
     maybe_continue_turn,
     should_finalize_on_max_iterations,
     should_stream_budget_response,
+    sustained_goal_continuation_inbound,
 )
 
 
@@ -49,11 +54,9 @@ async def test_maybe_continue_turn_queues_internal_message():
                 "message_id": "msg-1",
                 "origin_message_id": "msg-0",
                 "_wants_stream": True,
-                "_stream_id": "stream-1",
-                "_stream_delta": True,
-                "_stream_end": True,
-                "_resuming": True,
                 "webui": True,
+                "original_command": "/goal",
+                "goal_requested": True,
             },
         ),
         session_key="feishu:c1",
@@ -71,6 +74,7 @@ async def test_maybe_continue_turn_queues_internal_message():
     assert queued.sender_id == "system:continuation"
     assert queued.metadata[INTERNAL_CONTINUATION_META] is True
     assert queued.metadata[INTERNAL_CONTINUATION_KIND_META] == "sustained_goal"
+    assert sustained_goal_continuation_inbound(queued.metadata) is True
     assert queued.metadata[INTERNAL_CONTINUATION_RUN_STARTED_AT_META] == 1234.5
     assert internal_continuation_run_started_at(queued.metadata) == 1234.5
     assert internal_continuation_pending(ctx.msg.metadata)
@@ -78,16 +82,18 @@ async def test_maybe_continue_turn_queues_internal_message():
     assert queued.metadata["message_id"] == "msg-1"
     assert queued.metadata["origin_message_id"] == "msg-0"
     assert queued.metadata["_wants_stream"] is True
-    assert "_stream_id" not in queued.metadata
-    assert "_stream_delta" not in queued.metadata
-    assert "_stream_end" not in queued.metadata
-    assert "_resuming" not in queued.metadata
+    assert not explicit_goal_requested(queued.metadata)
+    assert sustained_goal_turn(meta, message_metadata=queued.metadata)
     assert "Finish the migration." in queued.content
     assert ctx.all_messages == messages[:-1]
     assert ctx.final_content == ""
     assert ctx.suppress_response is True
     assert ctx.msg.metadata[INTERNAL_CONTINUATION_PENDING_META] is True
     assert meta["_sustained_goal_continuation_rounds"] == 1
+
+
+def test_generic_internal_continuation_is_not_a_sustained_goal_continuation() -> None:
+    assert sustained_goal_continuation_inbound({INTERNAL_CONTINUATION_META: True}) is False
 
 
 @pytest.mark.asyncio
@@ -141,14 +147,13 @@ def test_internal_continuation_requires_budget_boundary_and_queue():
     )
 
 
-def test_save_skip_matches_prefix_when_current_message_merged():
+def test_save_skip_matches_prefix_when_current_message_was_persisted():
     skip = _save_skip_for_turn(
         message_metadata=None,
-        initial_message_count=2,  # [system, merged user]
-        history_count=1,
-        user_persisted_early=True,
+        initial_message_count=3,  # [system, history user, current user]
+        input_persisted_early=True,
     )
-    assert skip == 2
+    assert skip == 3
 
 
 def test_save_skip_unchanged_for_standalone_current_message():
@@ -156,12 +161,10 @@ def test_save_skip_unchanged_for_standalone_current_message():
     assert _save_skip_for_turn(
         message_metadata=None,
         initial_message_count=3,
-        history_count=1,
-        user_persisted_early=True,
+        input_persisted_early=True,
     ) == 3
     assert _save_skip_for_turn(
         message_metadata=None,
         initial_message_count=3,
-        history_count=1,
-        user_persisted_early=False,
+        input_persisted_early=False,
     ) == 2

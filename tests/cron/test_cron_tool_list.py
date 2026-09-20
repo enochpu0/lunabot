@@ -1,10 +1,12 @@
 """Tests for CronTool._list_jobs() output formatting."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from nanobot.agent.tools.context import RequestContext
+from nanobot.agent.tools.context import RequestContext, request_context
 from nanobot.agent.tools.cron import CronTool
 from nanobot.cron.service import CronService
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
@@ -321,11 +323,10 @@ def test_remove_protected_dream_job_returns_clear_feedback(tmp_path) -> None:
 
 def test_add_cron_job_defaults_to_tool_timezone(tmp_path) -> None:
     tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
-    tool.set_context(
+    with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
-    )
-
-    result = tool._add_job(None, "Morning standup", None, "0 8 * * *", None, None)
+    ):
+        result = tool._add_job(None, "Morning standup", None, "0 8 * * *", None, None)
 
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
@@ -334,25 +335,72 @@ def test_add_cron_job_defaults_to_tool_timezone(tmp_path) -> None:
 
 def test_add_at_job_uses_default_timezone_for_naive_datetime(tmp_path) -> None:
     tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
-    tool.set_context(
+    naive = (datetime.now(timezone.utc) + timedelta(days=1)).replace(tzinfo=None)
+    with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
-    )
-
-    result = tool._add_job(None, "Morning reminder", None, None, None, "2026-03-25T08:00:00")
+    ):
+        result = tool._add_job(None, "Morning reminder", None, None, None, naive.isoformat())
 
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
-    expected = int(datetime(2026, 3, 25, 0, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    expected = int(naive.replace(tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
     assert job.schedule.at_ms == expected
+
+def test_add_at_job_rejects_past_datetime(tmp_path) -> None:
+    tool = _make_tool_with_tz(tmp_path, "Asia/Shanghai")
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(None, "Old reminder", None, None, None, "2020-01-01T09:00:00")
+
+    assert "not in the future" in result
+    assert "2020-01-01T09:00:00" in result
+    assert tool._cron.list_jobs() == []
+
+def test_add_at_job_rejects_datetime_equal_to_now(tmp_path, monkeypatch) -> None:
+    tool = _make_tool(tmp_path)
+    fixed_now = 1_900_000_000.0
+    monkeypatch.setattr("nanobot.agent.tools.cron.time", SimpleNamespace(time=lambda: fixed_now))
+    at = datetime.fromtimestamp(fixed_now, tz=timezone.utc).isoformat()
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(None, "Deadline reminder", None, None, None, at)
+
+    assert "not in the future" in result
+    assert tool._cron.list_jobs() == []
+
+def test_add_at_job_accepts_future_datetime(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(None, "Future reminder", None, None, None, future)
+
+    assert result.startswith("Created job")
+    job = tool._cron.list_jobs()[0]
+    assert job.schedule.kind == "at"
+    assert job.state.next_run_at_ms is not None
+
+
+def test_add_job_rejects_multiple_schedule_fields(tmp_path) -> None:
+    tool = _make_tool(tmp_path)
+    with request_context(
+        RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+    ):
+        result = tool._add_job(None, "Morning standup", 60, "0 8 * * *", None, None)
+
+    assert result == "Error: exactly one of every_seconds, cron_expr, or at is required"
+    assert tool._cron.list_jobs() == []
 
 
 def test_add_job_binds_current_session_key(tmp_path) -> None:
     tool = _make_tool(tmp_path)
-    tool.set_context(
+    with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
-    )
-
-    result = tool._add_job(None, "Morning standup", 60, None, None, None)
+    ):
+        result = tool._add_job(None, "Morning standup", 60, None, None, None)
 
     assert result.startswith("Created job")
     job = tool._cron.list_jobs()[0]
@@ -366,9 +414,8 @@ def test_add_job_binds_current_session_key(tmp_path) -> None:
 
 def test_add_job_requires_session_key(tmp_path) -> None:
     tool = _make_tool(tmp_path)
-    tool.set_context(RequestContext(channel="telegram", chat_id="chat-1"))
-
-    result = tool._add_job(None, "Background refresh", 60, None, None, None)
+    with request_context(RequestContext(channel="telegram", chat_id="chat-1")):
+        result = tool._add_job(None, "Background refresh", 60, None, None, None)
 
     assert result == "Error: scheduled cron jobs must be created from a chat session"
     assert tool._cron.list_jobs() == []
@@ -403,11 +450,10 @@ def test_validate_params_requires_message_only_for_add(tmp_path) -> None:
 
 def test_add_job_empty_message_returns_actionable_error(tmp_path) -> None:
     tool = _make_tool(tmp_path)
-    tool.set_context(
+    with request_context(
         RequestContext(channel="telegram", chat_id="chat-1", session_key="telegram:chat-1")
-    )
-
-    result = tool._add_job(None, "", 60, None, None, None)
+    ):
+        result = tool._add_job(None, "", 60, None, None, None)
 
     assert "action='add' requires a non-empty 'message'" in result
     assert "Retry including message=" in result
@@ -417,11 +463,15 @@ def test_add_job_captures_owner_and_origin_without_legacy_delivery_fields(tmp_pa
     """CronTool stores owner/session identity separately from origin delivery context."""
     tool = _make_tool(tmp_path)
     meta = {"slack": {"thread_ts": "111.222", "channel_type": "channel"}}
-    tool.set_context(RequestContext(
-        channel="slack", chat_id="C99", metadata=meta, session_key="slack:C99:111.222"
-    ))
-
-    result = tool._add_job("test", "say hi", 60, None, None, None)
+    with request_context(
+        RequestContext(
+            channel="slack",
+            chat_id="C99",
+            metadata=meta,
+            session_key="slack:C99:111.222",
+        )
+    ):
+        result = tool._add_job("test", "say hi", 60, None, None, None)
     assert "Created job" in result
 
     jobs = tool._cron.list_jobs()

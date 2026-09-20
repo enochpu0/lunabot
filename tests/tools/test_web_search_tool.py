@@ -3,6 +3,7 @@
 import httpx
 import pytest
 
+from nanobot.agent.tools.registry import is_tool_error_result
 from nanobot.agent.tools.web import WebSearchTool
 from nanobot.config.schema import WebSearchConfig
 
@@ -131,12 +132,11 @@ async def test_tavily_search(monkeypatch):
     assert "https://openclaw.io" in result
 
 
-def test_keenable_without_api_key_is_treated_as_duckduckgo(monkeypatch):
-    # The REST API requires a key; without one we fall back to DuckDuckGo.
+def test_keenable_without_api_key_is_concurrency_safe(monkeypatch):
     monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
     tool = _tool(provider="keenable", api_key="")
-    assert tool.exclusive is True
-    assert tool.concurrency_safe is False
+    assert tool.exclusive is False
+    assert tool.concurrency_safe is True
 
 
 @pytest.mark.asyncio
@@ -159,20 +159,21 @@ async def test_keenable_search(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_keenable_fallback_to_duckduckgo_when_no_key(monkeypatch):
-    class MockDDGS:
-        def __init__(self, **kw):
-            pass
+async def test_keenable_without_api_key_uses_public_endpoint(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert url == "https://api.keenable.ai/v1/search/public"
+        assert "X-API-Key" not in kw["headers"]
+        assert kw["headers"]["X-Keenable-Title"] == "nanobot"
+        return _response(json={
+            "results": [{"title": "Public", "url": "https://keenable.ai/pub", "description": "ok"}]
+        })
 
-        def text(self, query, max_results=5):
-            return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
-
-    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
     monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
-
     tool = _tool(provider="keenable", api_key="")
     result = await tool.execute(query="keenable", count=1)
-    assert "DuckDuckGo fallback" in result
+    assert "Public" in result
+    assert "https://keenable.ai/pub" in result
 
 
 @pytest.mark.asyncio
@@ -199,6 +200,189 @@ async def test_keenable_search_http_error(monkeypatch):
     tool = _tool(provider="keenable", api_key="bad-keen-key")
     result = await tool.execute(query="keenable")
     assert "Error: Keenable search failed (401)" in result
+
+
+def test_serper_without_api_key_is_treated_as_duckduckgo(monkeypatch):
+    # Serper requires a key; without one we fall back to DuckDuckGo for concurrency.
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    tool = _tool(provider="serper", api_key="")
+    assert tool.exclusive is True
+    assert tool.concurrency_safe is False
+
+
+@pytest.mark.asyncio
+async def test_serper_search(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert url == "https://google.serper.dev/search"
+        assert kw["headers"]["X-API-KEY"] == "serper-key"
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
+        assert kw["json"] == {"q": "serper", "num": 1}
+        return _response(json={
+            "organic": [
+                {"title": "Serper", "link": "https://serper.dev", "snippet": "Google Search API"}
+            ]
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = _tool(provider="serper", api_key="serper-key", user_agent="nanobot-search-test")
+    result = await tool.execute(query="serper", count=1)
+    assert "Serper" in result
+    assert "https://serper.dev" in result
+    assert "Google Search API" in result
+
+
+@pytest.mark.asyncio
+async def test_serper_search_uses_env_api_key(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert kw["headers"]["X-API-KEY"] == "env-serper-key"
+        return _response(json={
+            "organic": [{"title": "Env", "link": "https://serper.dev/env", "snippet": "ok"}]
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    monkeypatch.setenv("SERPER_API_KEY", "env-serper-key")
+    tool = _tool(provider="serper", api_key="")
+    result = await tool.execute(query="serper", count=1)
+    assert "Env" in result
+
+
+@pytest.mark.asyncio
+async def test_serper_fallback_to_duckduckgo_when_no_key(monkeypatch):
+    class MockDDGS:
+        def __init__(self, **kw):
+            pass
+
+        def text(self, query, max_results=5):
+            return [{"title": "Fallback", "href": "https://ddg.example", "body": "DuckDuckGo fallback"}]
+
+    monkeypatch.setattr("ddgs.DDGS", MockDDGS)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+
+    tool = _tool(provider="serper", api_key="")
+    result = await tool.execute(query="serper", count=1)
+    assert "DuckDuckGo fallback" in result
+
+
+@pytest.mark.asyncio
+async def test_serper_search_http_error(monkeypatch):
+    async def mock_post(self, url, **kw):
+        return _response(status=403, json={"message": "Unauthorized"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = _tool(provider="serper", api_key="bad-serper-key")
+    result = await tool.execute(query="serper")
+    assert "Error: Serper search failed (403)" in result
+    assert is_tool_error_result(result)
+
+
+@pytest.mark.asyncio
+async def test_serper_search_rate_limited(monkeypatch):
+    async def mock_post(self, url, **kw):
+        return _response(status=429, json={"message": "rate limited"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = _tool(provider="serper", api_key="serper-key")
+    result = await tool.execute(query="serper")
+    assert "Serper search rate limited" in result
+    assert is_tool_error_result(result)
+
+
+def test_anysearch_remains_concurrency_safe_without_api_key(monkeypatch):
+    # Unlike keyed providers, AnySearch works without a key (anonymous quota),
+    # so it must never be treated as exclusive/serialized.
+    monkeypatch.delenv("ANYSEARCH_API_KEY", raising=False)
+    tool = _tool(provider="anysearch", api_key="")
+    assert tool.exclusive is False
+    assert tool.concurrency_safe is True
+
+
+@pytest.mark.asyncio
+async def test_anysearch_search(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert url == "https://api.anysearch.com/v1/search"
+        assert kw["headers"]["Authorization"] == "Bearer anysearch-key"
+        assert kw["headers"]["X-Anysearch-Client"] == "nanobot/1.0.0"
+        assert kw["headers"]["User-Agent"] == "nanobot-search-test"
+        assert kw["json"] == {"query": "anysearch", "max_results": 1}
+        return _response(json={
+            "code": 0,
+            "data": {
+                "results": [
+                    {"title": "AnySearch", "url": "https://anysearch.com", "content": "Search API"}
+                ],
+                "metadata": {"total_results": 1, "search_time_ms": 42},
+            },
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = _tool(provider="anysearch", api_key="anysearch-key", user_agent="nanobot-search-test")
+    result = await tool.execute(query="anysearch", count=1)
+    assert "AnySearch" in result
+    assert "https://anysearch.com" in result
+    assert "Search API" in result
+
+
+@pytest.mark.asyncio
+async def test_anysearch_without_api_key_uses_anonymous_quota(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert url == "https://api.anysearch.com/v1/search"
+        assert "Authorization" not in kw["headers"]
+        assert kw["headers"]["X-Anysearch-Client"] == "nanobot/1.0.0"
+        return _response(json={
+            "code": 0,
+            "data": {
+                "results": [{"title": "Anon", "url": "https://anysearch.com/anon", "snippet": "anonymous tier"}]
+            },
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    monkeypatch.delenv("ANYSEARCH_API_KEY", raising=False)
+    tool = _tool(provider="anysearch", api_key="", user_agent="nanobot-search-test")
+    result = await tool.execute(query="anysearch", count=1)
+    assert "Anon" in result
+    assert "anonymous tier" in result
+
+
+@pytest.mark.asyncio
+async def test_anysearch_search_uses_env_api_key(monkeypatch):
+    async def mock_post(self, url, **kw):
+        assert kw["headers"]["Authorization"] == "Bearer env-anysearch-key"
+        return _response(json={
+            "code": 0,
+            "data": {
+                "results": [{"title": "Env", "url": "https://anysearch.com/env", "content": "ok"}]
+            },
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    monkeypatch.setenv("ANYSEARCH_API_KEY", "env-anysearch-key")
+    tool = _tool(provider="anysearch", api_key="")
+    result = await tool.execute(query="anysearch", count=1)
+    assert "Env" in result
+
+
+@pytest.mark.asyncio
+async def test_anysearch_search_http_error(monkeypatch):
+    async def mock_post(self, url, **kw):
+        return _response(status=403, json={"code": -1, "message": "Forbidden"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = _tool(provider="anysearch", api_key="bad-anysearch-key")
+    result = await tool.execute(query="anysearch")
+    assert "Error: AnySearch search failed (403)" in result
+    assert is_tool_error_result(result)
+
+
+@pytest.mark.asyncio
+async def test_anysearch_search_rate_limited(monkeypatch):
+    async def mock_post(self, url, **kw):
+        return _response(status=429, json={"code": -1, "message": "rate limited"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    tool = _tool(provider="anysearch", api_key="")
+    result = await tool.execute(query="anysearch")
+    assert "AnySearch search rate limited" in result
+    assert is_tool_error_result(result)
 
 
 @pytest.mark.asyncio
@@ -363,6 +547,31 @@ async def test_duckduckgo_search(monkeypatch):
     tool = _tool(provider="duckduckgo")
     result = await tool.execute(query="hello")
     assert "DDG Result" in result
+
+
+@pytest.mark.asyncio
+async def test_duckduckgo_search_passes_proxy(monkeypatch):
+    """DDGS client must receive the configured proxy so search works behind a proxy."""
+    captured: dict = {}
+    proxy_url = "http://proxy.example:8080"
+
+    class ProxyCaptorDDGS:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def text(self, query, max_results=5):
+            return [{"title": "Result", "href": "https://example.com", "body": "OK"}]
+
+    monkeypatch.setattr("ddgs.DDGS", ProxyCaptorDDGS)
+
+    tool = WebSearchTool(
+        config=WebSearchConfig(provider="duckduckgo"),
+        proxy=proxy_url,
+    )
+    result = await tool.execute(query="test")
+    assert captured["proxy"] == proxy_url
+    assert captured["timeout"] == 10
+    assert "Result" in result
 
 
 @pytest.mark.asyncio
@@ -709,4 +918,6 @@ async def test_olostep_package_missing_returns_install_hint(monkeypatch):
     tool = _tool(provider="olostep", api_key="olostep-key")
     result = await tool.execute(query="test query")
 
-    assert result == "Error: olostep package not installed. Run: pip install olostep"
+    assert result == (
+        "Error: Olostep support is not installed. Run `nanobot plugins enable olostep`."
+    )

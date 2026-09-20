@@ -15,8 +15,10 @@ Match the recipe to the credential or endpoint you already have:
 | What you have | Recipe | Must match |
 |---|---|---|
 | A gateway key and model IDs that include a model family path, such as `provider/model-name` | [OpenRouter Gateway](#recipe-openrouter-gateway) | API key, provider config key, preset provider, and gateway model ID |
+| An OpenCode Zen or Go key | [OpenCode Zen or Go](#recipe-opencode-zen-or-go) | `OPENCODE_API_KEY`, the Zen/Go provider key, and a model ID from the matching OpenCode endpoint |
 | An OpenAI platform API key and OpenAI model ID | [OpenAI Direct](#recipe-openai-direct) | `OPENAI_API_KEY`, `provider: "openai"`, and an OpenAI model available to that account |
 | An Anthropic API key and Anthropic model ID | [Anthropic Direct](#recipe-anthropic-direct) | `ANTHROPIC_API_KEY`, `provider: "anthropic"`, and a non-gateway model ID |
+| A Kimi Coding Plan key | [Kimi Coding Plan](#recipe-kimi-coding-plan) | `KIMI_CODING_API_KEY`, `provider: "kimi_coding"`, and `model: "kimi-for-coding"` |
 | An OpenAI-compatible `/v1` endpoint that is not a named nanobot provider | [Custom OpenAI-Compatible Provider](#recipe-custom-openai-compatible-provider) | `apiBase`, optional API key, and the model ID served by that endpoint |
 | Ollama already running locally | [Ollama Local Model](#recipe-ollama-local-model) | Ollama `apiBase`, pulled model name, and local server availability |
 | vLLM, LM Studio, or another local OpenAI-compatible server | [vLLM or LM Studio](#recipe-vllm-or-lm-studio) | Local `/v1` base URL, any required key, and served model name |
@@ -25,7 +27,7 @@ Match the recipe to the credential or endpoint you already have:
 
 ## How to Use a Recipe
 
-1. Install nanobot and run `nanobot onboard` or `nanobot onboard --wizard` once so `~/.nanobot/config.json` exists.
+1. Install nanobot and run `nanobot onboard` once so `~/.nanobot/config.json` exists. Use `nanobot onboard --wizard` if you prefer prompts over hand-editing JSON.
 2. Put secrets in environment variables when possible.
 3. Merge the recipe snippet into `~/.nanobot/config.json`.
 4. Run `nanobot status`.
@@ -69,7 +71,6 @@ This recipe applies when one API key routes many hosted model families.
   },
   "modelPresets": {
     "primary": {
-      "label": "Primary",
       "provider": "openrouter",
       "model": "anthropic/claude-sonnet-4.5",
       "maxTokens": 4096,
@@ -94,6 +95,77 @@ nanobot agent -m "Hello!"
 
 If this fails with `401` or `unauthorized`, check that `OPENROUTER_API_KEY` is visible in the same terminal or service that starts nanobot. If it fails with `model not found`, choose a model ID that OpenRouter lists for your account.
 
+## Recipe: OpenCode Zen or Go
+
+This recipe applies when your credential comes from OpenCode Zen or OpenCode Go.
+Both providers use `OPENCODE_API_KEY`; pick the provider block that matches the
+subscription or balance you want to use.
+
+OpenCode Zen:
+
+```json
+{
+  "providers": {
+    "opencodeZen": {
+      "apiKey": "${OPENCODE_API_KEY}"
+    }
+  },
+  "modelPresets": {
+    "primary": {
+      "provider": "opencode_zen",
+      "model": "opencode/deepseek-v4-pro",
+      "maxTokens": 4096,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1
+    }
+  },
+  "agents": {
+    "defaults": {
+      "modelPreset": "primary"
+    }
+  }
+}
+```
+
+OpenCode Go:
+
+```json
+{
+  "providers": {
+    "opencodeGo": {
+      "apiKey": "${OPENCODE_API_KEY}"
+    }
+  },
+  "modelPresets": {
+    "primary": {
+      "provider": "opencode_go",
+      "model": "opencode-go/deepseek-v4-flash",
+      "maxTokens": 4096,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1
+    }
+  },
+  "agents": {
+    "defaults": {
+      "modelPreset": "primary"
+    }
+  }
+}
+```
+
+Verify:
+
+```bash
+nanobot status
+nanobot agent -m "Hello!"
+```
+
+OpenCode's docs list models across multiple endpoint types. The `opencode_zen`
+and `opencode_go` providers in nanobot use the OpenAI-compatible
+`chat/completions` path. If a model fails with `model not found` or an endpoint
+shape error, choose a model that OpenCode lists under `chat/completions` for the
+matching Zen or Go endpoint.
+
 ## Recipe: OpenAI Direct
 
 This recipe applies when you have an OpenAI API key and want to call OpenAI directly instead of through a gateway.
@@ -107,7 +179,6 @@ This recipe applies when you have an OpenAI API key and want to call OpenAI dire
   },
   "modelPresets": {
     "primary": {
-      "label": "OpenAI",
       "provider": "openai",
       "model": "gpt-5",
       "maxTokens": 4096,
@@ -144,7 +215,6 @@ This recipe applies when your key comes from Anthropic and your model name is an
   },
   "modelPresets": {
     "primary": {
-      "label": "Anthropic",
       "provider": "anthropic",
       "model": "claude-sonnet-4-5",
       "maxTokens": 4096,
@@ -180,7 +250,6 @@ If you use an Anthropic-compatible proxy, keep the preset provider as `anthropic
   },
   "modelPresets": {
     "primary": {
-      "label": "Anthropic proxy",
       "provider": "anthropic",
       "model": "claude-sonnet-4-5",
       "maxTokens": 4096,
@@ -198,6 +267,42 @@ If you use an Anthropic-compatible proxy, keep the preset provider as `anthropic
 
 Do not configure Anthropic-compatible endpoints as arbitrary custom provider names; named custom providers use the OpenAI-compatible request format.
 
+## Recipe: Kimi Coding Plan
+
+This recipe applies when your key comes from Kimi's Coding Plan endpoint. Nanobot uses a dedicated `kimi_coding` provider for this Anthropic Messages API endpoint; do not configure it as a generic `custom` provider.
+
+```json
+{
+  "providers": {
+    "kimiCoding": {
+      "apiKey": "${KIMI_CODING_API_KEY}"
+    }
+  },
+  "modelPresets": {
+    "kimiCoding": {
+      "provider": "kimi_coding",
+      "model": "kimi-for-coding",
+      "maxTokens": 4096,
+      "temperature": 0.1
+    }
+  },
+  "agents": {
+    "defaults": {
+      "modelPreset": "kimiCoding"
+    }
+  }
+}
+```
+
+Verify:
+
+```bash
+nanobot status
+nanobot agent -m "Hello!"
+```
+
+The default base URL is `https://api.kimi.com/coding/v1`. This endpoint requires a Claude-compatible `User-Agent`; nanobot sends `claude-code/0.1.0` by default. If your account requires a different value, override it with `providers.kimiCoding.extraHeaders.User-Agent`.
+
 ## Recipe: Custom OpenAI-Compatible Provider
 
 This recipe applies to an OpenAI-compatible service that is not a named nanobot provider.
@@ -212,7 +317,6 @@ This recipe applies to an OpenAI-compatible service that is not a named nanobot 
   },
   "modelPresets": {
     "primary": {
-      "label": "Custom",
       "provider": "custom",
       "model": "provider-model-name",
       "maxTokens": 4096,
@@ -252,7 +356,6 @@ For multiple custom endpoints, do not overload the single `custom` block. Name e
   },
   "modelPresets": {
     "work": {
-      "label": "Work proxy",
       "provider": "workProxy",
       "model": "gpt-4o-mini",
       "maxTokens": 4096,
@@ -260,7 +363,6 @@ For multiple custom endpoints, do not overload the single `custom` block. Name e
       "temperature": 0.1
     },
     "lab": {
-      "label": "Lab local",
       "provider": "lab-local",
       "model": "served-model-name",
       "maxTokens": 4096,
@@ -296,7 +398,6 @@ ollama pull llama3.2
   },
   "modelPresets": {
     "local": {
-      "label": "Local",
       "provider": "ollama",
       "model": "llama3.2",
       "maxTokens": 2048,
@@ -319,7 +420,13 @@ curl -sS http://localhost:11434/v1/models
 nanobot agent -m "Hello!"
 ```
 
-If you see `connection refused`, Ollama is not running or `apiBase` points to the wrong port. If the response is very slow, try a smaller local model or lower `contextWindowTokens`.
+If you see `connection refused`, Ollama is not running or `apiBase` points to the wrong port. If every response is slow, try a smaller local model or lower `contextWindowTokens`.
+
+If direct Ollama responses are fast but tool-using nanobot turns repeatedly evaluate
+thousands of prompt tokens, the model's chat template may be moving its tool
+definitions between requests. See
+[Improve Ollama Tool-Calling Prompt Cache Reuse](./guides/configure-ollama-prompt-cache.md)
+for a diagnostic procedure and an optional model-specific workaround.
 
 ## Recipe: vLLM or LM Studio
 
@@ -335,7 +442,6 @@ This recipe applies when a local server exposes an OpenAI-compatible `/v1` API.
   },
   "modelPresets": {
     "local": {
-      "label": "Local",
       "provider": "vllm",
       "model": "served-model-name",
       "maxTokens": 4096,
@@ -362,7 +468,6 @@ For LM Studio, use its local base URL and provider name:
   },
   "modelPresets": {
     "local": {
-      "label": "LM Studio",
       "provider": "lm_studio",
       "model": "local-model",
       "maxTokens": 2048,
@@ -387,7 +492,6 @@ This recipe applies when one provider sometimes rate-limits, one model is expens
 {
   "modelPresets": {
     "fast": {
-      "label": "Fast",
       "provider": "openrouter",
       "model": "anthropic/claude-sonnet-4.5",
       "maxTokens": 4096,
@@ -395,7 +499,6 @@ This recipe applies when one provider sometimes rate-limits, one model is expens
       "temperature": 0.1
     },
     "deep": {
-      "label": "Deep",
       "provider": "anthropic",
       "model": "claude-sonnet-4-5",
       "maxTokens": 4096,
@@ -403,7 +506,6 @@ This recipe applies when one provider sometimes rate-limits, one model is expens
       "temperature": 0.1
     },
     "local": {
-      "label": "Local",
       "provider": "ollama",
       "model": "llama3.2",
       "maxTokens": 2048,
@@ -431,7 +533,7 @@ This recipe applies after the agent works and you want observability for OpenAI-
 Install the optional package in the same Python environment that runs nanobot:
 
 ```bash
-python -m pip install langfuse
+nanobot plugins enable langfuse
 ```
 
 Set the environment variables before starting nanobot:
@@ -462,14 +564,12 @@ Use this after you have more than one preset and are chatting through a supporte
 {
   "modelPresets": {
     "fast": {
-      "label": "Fast",
       "provider": "openrouter",
       "model": "anthropic/claude-sonnet-4.5",
       "maxTokens": 4096,
       "contextWindowTokens": 65536
     },
     "local": {
-      "label": "Local",
       "provider": "ollama",
       "model": "llama3.2",
       "maxTokens": 2048,
@@ -492,7 +592,9 @@ In chat:
 /model fast
 ```
 
-`/model` switching is runtime-only. It does not rewrite `config.json`, and an in-progress turn keeps using the model it started with.
+`/model` stores the selection in the current session without rewriting `config.json`.
+The selection survives restarts, does not affect other sessions, and an in-progress
+turn keeps using the model it started with.
 
 ## Quick Failure Map
 

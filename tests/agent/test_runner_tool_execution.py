@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.agent.runner import AgentRunner, AgentRunSpec
-from nanobot.agent.tools.base import Tool
+from agent.runner_helpers import make_run_spec
+from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.runner import AgentRunner
+from nanobot.agent.tools.base import Tool, ToolResult
+from nanobot.agent.tools.context import ToolContext
+from nanobot.agent.tools.execution import execute_tool_calls
+from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMResponse, ToolCallRequest
@@ -61,17 +67,51 @@ class _DelayTool(Tool):
         return self._name
 
 
+class _LegacyErrorPluginTool(Tool):
+    @property
+    def name(self) -> str:
+        return "legacy_plugin"
+
+    @property
+    def description(self) -> str:
+        return "legacy entry-point plugin"
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+    async def execute(self, **kwargs):
+        return "Error: legacy plugin failed"
+
+
+class _StructuredSuccessPluginTool(Tool):
+    @property
+    def name(self) -> str:
+        return "structured_success_plugin"
+
+    @property
+    def description(self) -> str:
+        return "structured entry-point plugin"
+
+    @property
+    def parameters(self) -> dict:
+        return {"type": "object", "properties": {}, "required": []}
+
+    async def execute(self, **kwargs):
+        return ToolResult("Error: generated report successfully")
+
+
 async def _run_optional_tool_response(response: LLMResponse):
     provider = MagicMock()
     calls = {"n": 0}
 
-    async def chat_with_retry(*, messages, **kwargs):
+    async def chat_stream_with_retry(*, messages, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             return response
-        return LLMResponse(content="done", tool_calls=[], usage={})
+        return LLMResponse(content="done", tool_calls=[], usage=None)
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = ToolRegistry()
     shared_events: list[str] = []
     tools.register(_DelayTool(
@@ -81,7 +121,7 @@ async def _run_optional_tool_response(response: LLMResponse):
         shared_events=shared_events,
     ))
 
-    result = await AgentRunner(provider).run(AgentRunSpec(
+    result = await AgentRunner().run(make_run_spec(provider,
         initial_messages=[{"role": "user", "content": "try optional"}],
         tools=tools,
         model="test-model",
@@ -89,6 +129,20 @@ async def _run_optional_tool_response(response: LLMResponse):
         max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
     ))
     return result, shared_events
+
+
+def _load_entry_point_plugin(tool_cls: type[Tool], tmp_path) -> ToolRegistry:
+    mock_ep = MagicMock()
+    mock_ep.name = tool_cls.__name__
+    mock_ep.load.return_value = tool_cls
+
+    registry = ToolRegistry()
+    with patch("nanobot.agent.tools.loader.entry_points", return_value=[mock_ep]):
+        ToolLoader(test_classes=[]).load(
+            ToolContext(config=None, workspace=str(tmp_path)),
+            registry,
+        )
+    return registry
 
 
 def _tool_message(result, tool_call_id: str) -> dict:
@@ -99,7 +153,69 @@ def _tool_message(result, tool_call_id: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_runner_batches_read_only_tools_before_exclusive_work():
+async def test_tool_execution_propagates_preparation_failure():
+    tools = MagicMock()
+    tools.prepare_call.side_effect = RuntimeError("tool preparation failed")
+    tools.execute = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="tool preparation failed"):
+        await execute_tool_calls(
+            tools,
+            [ToolCallRequest(id="call-1", name="demo", arguments={})],
+            concurrent=False,
+            external_lookup_counts={},
+            workspace_violation_counts={},
+            hook=AgentHook(),
+            context=AgentHookContext(iteration=0, messages=[]),
+        )
+
+    tools.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_propagates_cancellation_without_error_hook():
+    tools = MagicMock()
+    tools.prepare_call.return_value = (None, {}, None)
+    tools.execute = AsyncMock(side_effect=asyncio.CancelledError)
+
+    events: list[str] = []
+
+    class RecordingHook(AgentHook):
+        async def before_execute_tool(
+            self,
+            context: AgentHookContext,
+            tool_call: ToolCallRequest,
+            tool: Any,
+            params: Any,
+        ) -> None:
+            events.append("before")
+
+        async def on_execute_tool_error(
+            self,
+            context: AgentHookContext,
+            tool_call: ToolCallRequest,
+            tool: Any,
+            params: Any,
+            error: Any,
+        ) -> None:
+            events.append("error")
+
+    with pytest.raises(asyncio.CancelledError):
+        await execute_tool_calls(
+            tools,
+            [ToolCallRequest(id="call-1", name="demo", arguments={})],
+            concurrent=False,
+            external_lookup_counts={},
+            workspace_violation_counts={},
+            hook=RecordingHook(),
+            context=AgentHookContext(iteration=0, messages=[]),
+        )
+
+    assert events == ["before"]
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_batches_read_only_tools_before_exclusive_work():
     tools = ToolRegistry()
     shared_events: list[str] = []
     read_a = _DelayTool("read_a", delay=0.05, read_only=True, shared_events=shared_events)
@@ -109,23 +225,18 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
     tools.register(read_b)
     tools.register(write_a)
 
-    runner = AgentRunner(MagicMock())
-    await runner._execute_tools(
-        AgentRunSpec(
-            initial_messages=[],
-            tools=tools,
-            model="test-model",
-            max_iterations=1,
-            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-            concurrent_tools=True,
-        ),
+    await execute_tool_calls(
+        tools,
         [
             ToolCallRequest(id="ro1", name="read_a", arguments={}),
             ToolCallRequest(id="ro2", name="read_b", arguments={}),
             ToolCallRequest(id="rw1", name="write_a", arguments={}),
         ],
-        {},
-        {},
+        concurrent=True,
+        external_lookup_counts={},
+        workspace_violation_counts={},
+        hook=AgentHook(),
+        context=AgentHookContext(iteration=0, messages=[]),
     )
 
     assert shared_events[0:2] == ["start:read_a", "start:read_b"]
@@ -136,7 +247,7 @@ async def test_runner_batches_read_only_tools_before_exclusive_work():
 
 
 @pytest.mark.asyncio
-async def test_runner_does_not_batch_exclusive_read_only_tools():
+async def test_tool_execution_does_not_batch_exclusive_read_only_tools():
     tools = ToolRegistry()
     shared_events: list[str] = []
     read_a = _DelayTool("read_a", delay=0.03, read_only=True, shared_events=shared_events)
@@ -152,23 +263,18 @@ async def test_runner_does_not_batch_exclusive_read_only_tools():
     tools.register(ddg_like)
     tools.register(read_b)
 
-    runner = AgentRunner(MagicMock())
-    await runner._execute_tools(
-        AgentRunSpec(
-            initial_messages=[],
-            tools=tools,
-            model="test-model",
-            max_iterations=1,
-            max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
-            concurrent_tools=True,
-        ),
+    await execute_tool_calls(
+        tools,
         [
             ToolCallRequest(id="ro1", name="read_a", arguments={}),
             ToolCallRequest(id="ddg1", name="ddg_like", arguments={}),
             ToolCallRequest(id="ro2", name="read_b", arguments={}),
         ],
-        {},
-        {},
+        concurrent=True,
+        external_lookup_counts={},
+        workspace_violation_counts={},
+        hook=AgentHook(),
+        context=AgentHookContext(iteration=0, messages=[]),
     )
 
     assert shared_events[0] == "start:read_a"
@@ -182,7 +288,7 @@ async def test_runner_rejects_near_miss_tool_name_without_executing():
     call_count = {"n": 0}
     captured_second_call: list[dict] = []
 
-    async def chat_with_retry(*, messages, **kwargs):
+    async def chat_stream_with_retry(*, messages, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return LLMResponse(
@@ -195,12 +301,12 @@ async def test_runner_rejects_near_miss_tool_name_without_executing():
                     )
                 ],
                 finish_reason="tool_calls",
-                usage={},
+                usage=None,
             )
         captured_second_call[:] = messages
-        return LLMResponse(content="done", tool_calls=[], usage={})
+        return LLMResponse(content="done", tool_calls=[], usage=None)
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = ToolRegistry()
     shared_events: list[str] = []
     tools.register(_DelayTool(
@@ -210,8 +316,8 @@ async def test_runner_rejects_near_miss_tool_name_without_executing():
         shared_events=shared_events,
     ))
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[{"role": "user", "content": "read notes"}],
         tools=tools,
         model="test-model",
@@ -321,29 +427,88 @@ async def test_runner_rejects_openai_responses_array_arguments_without_executing
 
 
 @pytest.mark.asyncio
+async def test_runner_returns_legacy_entry_point_error_to_model(tmp_path):
+    provider = MagicMock()
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="working",
+            tool_calls=[ToolCallRequest(id="call_1", name="legacy_plugin", arguments={})],
+            usage=None,
+        ),
+        LLMResponse(content="reported plugin failure", tool_calls=[], usage=None),
+    ])
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "run plugin"}],
+        tools=_load_entry_point_plugin(_LegacyErrorPluginTool, tmp_path),
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "reported plugin failure"
+    assert result.tool_events == [
+        {"name": "legacy_plugin", "status": "error", "detail": "Error: legacy plugin failed"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_preserves_structured_plugin_success_that_starts_with_error(tmp_path):
+    provider = MagicMock()
+    provider.chat_stream_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="working",
+            tool_calls=[
+                ToolCallRequest(id="call_1", name="structured_success_plugin", arguments={})
+            ],
+            usage=None,
+        ),
+        LLMResponse(content="done", tool_calls=[], usage=None),
+    ])
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "run plugin"}],
+        tools=_load_entry_point_plugin(_StructuredSuccessPluginTool, tmp_path),
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.stop_reason == "completed"
+    assert result.tool_events == [
+        {
+            "name": "structured_success_plugin",
+            "status": "ok",
+            "detail": "Error: generated report successfully",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runner_blocks_repeated_external_fetches():
     provider = MagicMock()
     captured_final_call: list[dict] = []
     call_count = {"n": 0}
 
-    async def chat_with_retry(*, messages, **kwargs):
+    async def chat_stream_with_retry(*, messages, **kwargs):
         call_count["n"] += 1
         if call_count["n"] <= 3:
             return LLMResponse(
                 content="working",
                 tool_calls=[ToolCallRequest(id=f"call_{call_count['n']}", name="web_fetch", arguments={"url": "https://example.com"})],
-                usage={},
+                usage=None,
             )
         captured_final_call[:] = messages
-        return LLMResponse(content="done", tool_calls=[], usage={})
+        return LLMResponse(content="done", tool_calls=[], usage=None)
 
-    provider.chat_with_retry = chat_with_retry
+    provider.chat_stream_with_retry = chat_stream_with_retry
     tools = MagicMock()
     tools.get_definitions.return_value = []
     tools.execute = AsyncMock(return_value="page content")
 
-    runner = AgentRunner(provider)
-    result = await runner.run(AgentRunSpec(
+    runner = AgentRunner()
+    result = await runner.run(make_run_spec(provider,
         initial_messages=[{"role": "user", "content": "research task"}],
         tools=tools,
         model="test-model",
