@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from nanobot.session.goal_state import (
     GOAL_STATE_KEY,
+    MAX_GOAL_OBJECTIVE_CHARS,
     discard_legacy_goal_state_key,
+    explicit_goal_requested,
     goal_state_runtime_lines,
     goal_state_ws_blob,
     parse_goal_state,
-    runner_wall_llm_timeout_s,
     sustained_goal_active,
 )
-from nanobot.session.manager import SessionManager
 
 
 def test_runtime_lines_empty_when_no_metadata():
@@ -38,6 +38,16 @@ def test_runtime_lines_include_objective_when_active():
     assert "Goal (active):" in lines
     assert "Ship the fix." in lines
     assert any("Summary: fix" in ln for ln in lines)
+
+
+def test_runtime_lines_preserve_maximum_accepted_objective():
+    objective = "x" * MAX_GOAL_OBJECTIVE_CHARS
+
+    lines = goal_state_runtime_lines(
+        {GOAL_STATE_KEY: {"status": "active", "objective": objective}}
+    )
+
+    assert lines == ["Goal (active):", objective]
 
 
 def test_runtime_lines_read_legacy_thread_goal_key():
@@ -88,8 +98,27 @@ def test_goal_state_ws_blob_active_shape():
     }
     assert goal_state_ws_blob(meta) == {
         "active": True,
+        "status": "active",
         "ui_summary": "feat",
         "objective": "Build feature.",
+    }
+
+
+def test_goal_state_ws_blob_preserves_blocked_state_for_host_attention():
+    meta = {
+        GOAL_STATE_KEY: {
+            "status": "blocked",
+            "objective": "Deploy safely.",
+            "ui_summary": "Approval required",
+            "recap": "Production access is required.",
+        },
+    }
+    assert goal_state_ws_blob(meta) == {
+        "active": False,
+        "status": "blocked",
+        "ui_summary": "Approval required",
+        "objective": "Deploy safely.",
+        "recap": "Production access is required.",
     }
 
 
@@ -109,23 +138,7 @@ def test_sustained_goal_active_respects_legacy_thread_goal_key():
     assert sustained_goal_active(meta) is True
 
 
-def test_runner_wall_llm_timeout_uses_metadata_override(tmp_path):
-    sm = SessionManager(tmp_path)
-    assert (
-        runner_wall_llm_timeout_s(
-            sm,
-            "cli:test",
-            metadata={GOAL_STATE_KEY: {"status": "active", "objective": "x"}},
-        )
-        == 0.0
-    )
-    assert runner_wall_llm_timeout_s(sm, "cli:test", metadata={}) is None
-
-
-def test_runner_wall_llm_timeout_reads_session_when_metadata_missing(tmp_path):
-    sm = SessionManager(tmp_path)
-    sess = sm.get_or_create("c:d")
-    sess.metadata = {GOAL_STATE_KEY: {"status": "active", "objective": "z"}}
-    assert runner_wall_llm_timeout_s(sm, "c:d") == 0.0
-    sess.metadata = {}
-    assert runner_wall_llm_timeout_s(sm, "c:d") is None
+def test_explicit_goal_requested_only_reads_command_metadata():
+    assert explicit_goal_requested({}) is False
+    message_meta = {"original_command": "/goal", "goal_requested": True}
+    assert explicit_goal_requested(message_meta) is True

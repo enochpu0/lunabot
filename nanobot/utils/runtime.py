@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from loguru import logger
 
@@ -14,6 +14,7 @@ _MAX_REPEAT_EXTERNAL_LOOKUPS = 2
 
 # Third same-target workspace violation in a turn escalates to "stop retrying".
 _MAX_REPEAT_WORKSPACE_VIOLATIONS = 2
+_LENGTH_RECOVERY_TAIL_CHARS = 64
 
 EMPTY_FINAL_RESPONSE_MESSAGE = (
     "I completed the tool steps but couldn't produce a final answer. "
@@ -24,11 +25,20 @@ FINALIZATION_RETRY_PROMPT = (
     "Please provide your response to the user based on the conversation above."
 )
 
-LENGTH_RECOVERY_PROMPT = (
-    "Output limit reached. Continue exactly where you left off "
-    "— no recap, no apology. Break remaining work into smaller steps if needed."
+BUDGET_EXHAUSTED_FINALIZATION_PROMPT = (
+    "The tool-call budget for this turn is exhausted. Based only on the "
+    "conversation and tool results above, provide a concise final response to "
+    "the user. Do not call or request tools. Do not claim the task is complete "
+    "unless the evidence above clearly shows it is complete. State what was "
+    "done, what remains, and the best next step if anything is incomplete."
 )
 
+LENGTH_RECOVERY_PROMPT = (
+    "The previous assistant response was cut off. Continue the same response from its "
+    "exact endpoint. Output only new continuation text in the same language and style. "
+    "Do not acknowledge this instruction, restart the response, repeat its title or any "
+    "existing text, recap, or apologize."
+)
 
 def empty_tool_result_message(tool_name: str) -> str:
     """Short prompt-safe marker for tools that completed without visible output."""
@@ -44,10 +54,10 @@ def ensure_nonempty_tool_result(tool_name: str, content: Any) -> Any:
     if isinstance(content, list):
         if not content:
             return empty_tool_result_message(tool_name)
-        text_payload = stringify_text_blocks(content)
+        text_payload = stringify_text_blocks(cast(list[Any], content))
         if text_payload is not None and not text_payload.strip():
             return empty_tool_result_message(tool_name)
-    return content
+    return cast(Any, content)
 
 
 def is_blank_text(content: str | None) -> bool:
@@ -60,13 +70,31 @@ def build_finalization_retry_message() -> dict[str, str]:
     return {"role": "user", "content": FINALIZATION_RETRY_PROMPT}
 
 
-def build_length_recovery_message() -> dict[str, str]:
+def build_budget_exhausted_finalization_message() -> dict[str, str]:
+    """Prompt the model for a no-tools final response after budget exhaustion."""
+    return {"role": "user", "content": BUDGET_EXHAUSTED_FINALIZATION_PROMPT}
+
+
+def build_length_recovery_message(content: str) -> dict[str, str]:
     """Prompt the model to continue after hitting output token limit."""
-    return {"role": "user", "content": LENGTH_RECOVERY_PROMPT}
+    tail = content[-_LENGTH_RECOVERY_TAIL_CHARS:]
+    prompt = (
+        f"{LENGTH_RECOVERY_PROMPT}\n\n"
+        "The following tail was already delivered to the user. Treat it as immutable "
+        "context and do not output it again:\n"
+        "<already_delivered_tail>\n"
+        f"{tail}\n"
+        "</already_delivered_tail>\n"
+        "Begin with the text that belongs immediately after this tail."
+    )
+    return {"role": "user", "content": prompt}
 
 
-def external_lookup_signature(tool_name: str, arguments: dict[str, Any]) -> str | None:
+def external_lookup_signature(tool_name: str, arguments: Any) -> str | None:
     """Stable signature for repeated external lookups we want to throttle."""
+    if not isinstance(arguments, dict):
+        return None
+    arguments = cast(dict[str, Any], arguments)
     if tool_name == "web_fetch":
         url = str(arguments.get("url") or "").strip()
         if url:
@@ -80,7 +108,7 @@ def external_lookup_signature(tool_name: str, arguments: dict[str, Any]) -> str 
 
 def repeated_external_lookup_error(
     tool_name: str,
-    arguments: dict[str, Any],
+    arguments: Any,
     seen_counts: dict[str, int],
 ) -> str | None:
     """Block repeated external lookups after a small retry budget."""
@@ -109,9 +137,12 @@ _OUTSIDE_PATH_PATTERN = re.compile(r"(?:^|[\s|>'\"])((?:/[^\s\"'>;|<]+)|(?:~[^\s
 
 def workspace_violation_signature(
     tool_name: str,
-    arguments: dict[str, Any],
+    arguments: Any,
 ) -> str | None:
     """Return a stable cross-tool signature for the outside-workspace target."""
+    if not isinstance(arguments, dict):
+        return None
+    arguments = cast(dict[str, Any], arguments)
     for key in ("path", "file_path", "target", "source", "destination"):
         val = arguments.get(key)
         if isinstance(val, str) and val.strip():
@@ -141,7 +172,7 @@ def _normalize_violation_target(raw: str) -> str:
 
 def repeated_workspace_violation_error(
     tool_name: str,
-    arguments: dict[str, Any],
+    arguments: Any,
     seen_counts: dict[str, int],
 ) -> str | None:
     """Return an escalated error after repeated bypass attempts."""

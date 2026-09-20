@@ -984,3 +984,45 @@ def test_validate_content_size_over_limit(tmp_path: Path) -> None:
     result = loader._validate_content_size("a" * 100_001)
     assert result is not None
     assert "100,001" in result and "100,000" in result
+
+
+def test_check_requirements_tolerates_null_requires_and_lists(tmp_path: Path) -> None:
+    """Null requires/bins/env must not crash skill listing (JSON/YAML nulls)."""
+    workspace = tmp_path / "ws"
+    ws_skills = workspace / "skills"
+    ws_skills.mkdir(parents=True)
+    _write_skill(
+        ws_skills,
+        "null-requires",
+        metadata_json={"always": True, "requires": None},
+        body="# Null requires",
+    )
+    _write_skill(
+        ws_skills,
+        "null-bins",
+        metadata_json={"always": True, "requires": {"bins": None, "env": None}},
+        body="# Null bins",
+    )
+    _write_skill(
+        ws_skills,
+        "null-elems",
+        metadata_json={"always": True, "requires": {"bins": [None, ""], "env": [None]}},
+        body="# Null elems",
+    )
+    builtin = tmp_path / "builtin"
+    builtin.mkdir()
+    loader = SkillsLoader(workspace, builtin_skills_dir=builtin)
+
+    assert loader._check_requirements(loader._get_skill_meta("null-requires")) is True
+    assert loader._check_requirements(loader._get_skill_meta("null-bins")) is True
+    assert loader._check_requirements(loader._get_skill_meta("null-elems")) is True
+    always = loader.get_always_skills()
+    assert set(always) >= {"null-requires", "null-bins", "null-elems"}
+    listed = {e["name"] for e in loader.list_skills(filter_unavailable=True)}
+    assert {"null-requires", "null-bins", "null-elems"} <= listed
+    assert loader.get_skill_requirements("null-requires") == {
+        "bins": [],
+        "env": [],
+        "missing_bins": [],
+        "missing_env": [],
+    }

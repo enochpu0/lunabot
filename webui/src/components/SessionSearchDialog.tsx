@@ -8,7 +8,7 @@ import {
   DialogDescription,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { deriveTitle } from "@/lib/format";
+import { deriveTitle, visibleSessionPreview } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { ChatSummary } from "@/lib/types";
 
@@ -22,28 +22,42 @@ interface SessionSearchDialogProps {
   onSelect: (key: string) => void;
 }
 
+const EMPTY_TITLE_OVERRIDES: Record<string, string> = {};
+
 export function SessionSearchDialog({
   open,
   sessions,
   activeKey,
   loading,
-  titleOverrides = {},
+  titleOverrides = EMPTY_TITLE_OVERRIDES,
   onOpenChange,
   onSelect,
 }: SessionSearchDialogProps) {
   const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const [query, setQuery] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
 
   const normalizedQuery = query.trim().toLowerCase();
-  const results = useMemo(() => {
+  const searchableSessions = useMemo(() => sessions.map((session) => ({
+    session,
+    text: [titleOverrides[session.key], session.title, visibleSessionPreview(session.preview)]
+      .filter(Boolean).join(" ").toLowerCase(),
+  })), [sessions, titleOverrides]);
+  const sessionResults = useMemo(() => {
+    if (!open) return [];
     if (!normalizedQuery) return sessions;
     const terms = normalizedQuery.split(/\s+/).filter(Boolean);
-    return sessions.filter((session) =>
-      sessionMatchesTerms(session, terms, titleOverrides[session.key]),
-    );
-  }, [normalizedQuery, sessions, titleOverrides]);
+    return searchableSessions.filter(({ text }) => terms.every((term) => text.includes(term)))
+      .map(({ session }) => session);
+  }, [normalizedQuery, open, sessions, searchableSessions]);
+  const itemCount = sessionResults.length;
+  const rowHeight = 64;
+  const windowStart = Math.max(0, Math.min(itemCount - 1, Math.floor(scrollTop / rowHeight) - 4));
+  const windowEnd = Math.min(itemCount, windowStart + 24);
 
   useEffect(() => {
     if (!open) return;
@@ -54,13 +68,35 @@ export function SessionSearchDialog({
 
   useEffect(() => {
     setHighlightedIndex(0);
+    setScrollTop(0);
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [normalizedQuery]);
 
   useEffect(() => {
     setHighlightedIndex((index) =>
-      results.length === 0 ? 0 : Math.min(index, results.length - 1),
+      itemCount === 0 ? 0 : Math.min(index, itemCount - 1),
     );
-  }, [results.length]);
+  }, [itemCount]);
+
+  useEffect(() => {
+    itemRefs.current = itemRefs.current.slice(0, itemCount);
+  }, [itemCount]);
+
+  useEffect(() => {
+    if (!open) return;
+    const scroller = scrollRef.current;
+    if (scroller) {
+      const top = highlightedIndex * rowHeight;
+      if (top < scroller.scrollTop || top + rowHeight > scroller.scrollTop + scroller.clientHeight) {
+        scroller.scrollTop = top;
+        setScrollTop(top);
+      }
+    }
+    itemRefs.current[highlightedIndex]?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+    });
+  }, [highlightedIndex, open]);
 
   const handleSelect = (key: string) => {
     onOpenChange(false);
@@ -71,17 +107,19 @@ export function SessionSearchDialog({
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setHighlightedIndex((index) =>
-        results.length === 0 ? 0 : Math.min(index + 1, results.length - 1),
+        itemCount === 0 ? 0 : (index + 1) % itemCount,
       );
       return;
     }
     if (event.key === "ArrowUp") {
       event.preventDefault();
-      setHighlightedIndex((index) => Math.max(index - 1, 0));
+      setHighlightedIndex((index) =>
+        itemCount === 0 ? 0 : (index - 1 + itemCount) % itemCount,
+      );
       return;
     }
     if (event.key === "Enter") {
-      const highlighted = results[highlightedIndex];
+      const highlighted = sessionResults[highlightedIndex];
       if (!highlighted) return;
       event.preventDefault();
       handleSelect(highlighted.key);
@@ -102,18 +140,16 @@ export function SessionSearchDialog({
       <DialogContent
         showCloseButton={false}
         className={cn(
-          "max-h-[min(34rem,calc(100vh-2rem))] w-[calc(100vw-2rem)] max-w-[42rem] gap-0 overflow-hidden p-0",
-          "rounded-2xl border border-border/70 bg-popover/95 text-popover-foreground shadow-2xl backdrop-blur-xl",
-          "sm:rounded-2xl",
+          "flex max-h-[min(40rem,calc(100vh-2rem))] w-[calc(100vw-2rem)] max-w-[42rem] flex-col gap-0 overflow-hidden p-0",
         )}
       >
         <DialogTitle className="sr-only">{t("sidebar.searchAria")}</DialogTitle>
         <DialogDescription className="sr-only">
           {t("sidebar.searchPlaceholder")}
         </DialogDescription>
-        <div className="flex h-14 items-center gap-3 border-b border-border/60 px-5">
+        <div className="flex h-[62px] shrink-0 items-center gap-3 border-b border-border px-[18px]">
           <Search
-            className="h-4 w-4 shrink-0 text-muted-foreground"
+            className="h-[18px] w-[18px] shrink-0 text-muted-foreground"
             aria-hidden
           />
           <input
@@ -123,91 +159,87 @@ export function SessionSearchDialog({
             onKeyDown={handleKeyDown}
             placeholder={t("sidebar.searchPlaceholder")}
             aria-label={t("sidebar.searchAria")}
-            className="h-full min-w-0 flex-1 bg-transparent text-[15px] font-medium text-foreground outline-none placeholder:text-muted-foreground/75"
+            className="h-full min-w-0 flex-1 bg-transparent text-[19px] font-normal leading-none text-foreground outline-none placeholder:text-muted-foreground"
           />
         </div>
 
-        <div className="min-h-0 overflow-y-auto overscroll-contain p-2">
-          <div className="px-2 pb-1.5 pt-1 text-[12px] font-medium text-muted-foreground/70">
-            {sectionLabel}
-          </div>
+        <div
+          ref={scrollRef}
+          onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+          data-testid="session-search-scroll"
+          className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2.5 scrollbar-thin scrollbar-track-transparent"
+        >
+          <section>
+            <div className="px-2.5 pb-1.5 pt-1 text-[12px] font-medium text-muted-foreground">
+              {sectionLabel}
+            </div>
 
-          {loading && sessions.length === 0 ? (
-            <div className="px-3 py-7 text-[13px] text-muted-foreground">
-              {t("chat.loading")}
-            </div>
-          ) : results.length === 0 ? (
-            <div className="px-3 py-7 text-[13px] text-muted-foreground">
-              {emptyLabel}
-            </div>
-          ) : (
-            <ul className="space-y-1">
-              {results.map((session, index) => {
-                const title = titleOverrides[session.key]?.trim() ||
-                  session.title?.trim() ||
-                  deriveTitle(session.preview, t("chat.newChat"));
-                const preview = session.preview.trim();
-                const showPreview =
-                  preview.length > 0 &&
-                  preview.toLowerCase() !== title.trim().toLowerCase();
-                const highlighted = index === highlightedIndex;
-                const active = session.key === activeKey;
-                return (
-                  <li key={session.key}>
-                    <button
-                      type="button"
-                      onClick={() => handleSelect(session.key)}
-                      onMouseEnter={() => setHighlightedIndex(index)}
-                      aria-current={active ? "page" : undefined}
-                      className={cn(
-                        "flex min-h-12 w-full min-w-0 rounded-xl px-3 py-2.5 text-left transition-colors",
-                        highlighted
-                          ? "bg-accent text-accent-foreground"
-                          : "text-popover-foreground hover:bg-accent/75 hover:text-accent-foreground",
-                      )}
-                    >
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[14px] font-medium leading-5">
-                          {title}
+            {loading && sessions.length === 0 ? (
+              <div className="px-3 py-7 text-[13px] text-muted-foreground">
+                {t("chat.loading")}
+              </div>
+            ) : sessionResults.length === 0 ? (
+              <div className="px-3 py-7 text-[13px] text-muted-foreground">
+                {emptyLabel}
+              </div>
+            ) : (
+              <ul>
+                <li aria-hidden style={{ height: windowStart * rowHeight }} />
+                {sessionResults.slice(windowStart, windowEnd).map((session, offset) => {
+                  const index = windowStart + offset;
+                  const title = titleOverrides[session.key]?.trim() ||
+                    session.title?.trim() ||
+                    deriveTitle(session.preview, t("chat.newChat"));
+                  const preview = visibleSessionPreview(session.preview);
+                  const showPreview =
+                    preview.length > 0 &&
+                    preview.toLowerCase() !== title.trim().toLowerCase();
+                  const highlighted = index === highlightedIndex;
+                  const active = session.key === activeKey;
+                  return (
+                    <li key={session.key} style={{ height: rowHeight }}>
+                      <button
+                        ref={(node) => {
+                          itemRefs.current[index] = node;
+                        }}
+                        type="button"
+                        onClick={() => handleSelect(session.key)}
+                        onMouseEnter={() => setHighlightedIndex(index)}
+                        aria-current={active ? "page" : undefined}
+                        className={cn(
+                          "grid h-full w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-control px-3 py-2 text-left transition-colors",
+                          highlighted
+                            ? "bg-muted text-foreground"
+                            : "text-foreground hover:bg-muted",
+                        )}
+                      >
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[14px] font-medium leading-5">
+                            {title}
+                          </span>
+                          {showPreview ? (
+                            <span
+                              className="block truncate text-[12px] leading-4 text-muted-foreground"
+                            >
+                              {preview}
+                            </span>
+                          ) : null}
                         </span>
-                        {showPreview ? (
-                          <span
-                            className={cn(
-                              "block truncate text-[12px] leading-4",
-                              highlighted
-                                ? "text-accent-foreground/70"
-                                : "text-muted-foreground",
-                            )}
-                          >
-                            {preview}
+                        {active ? (
+                          <span className="shrink-0 rounded-full bg-muted-foreground/10 px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+                            {t("common.current", { defaultValue: "Current" })}
                           </span>
                         ) : null}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+                      </button>
+                    </li>
+                  );
+                })}
+                <li aria-hidden style={{ height: (itemCount - windowEnd) * rowHeight }} />
+              </ul>
+            )}
+          </section>
         </div>
       </DialogContent>
     </Dialog>
   );
-}
-
-function sessionMatchesTerms(
-  session: ChatSummary,
-  terms: string[],
-  titleOverride?: string,
-) {
-  const haystack = [
-    titleOverride,
-    session.title,
-    session.preview,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-
-  return terms.every((term) => haystack.includes(term));
 }

@@ -12,42 +12,32 @@ software together: with care, clarity, and respect for the next person reading t
 
 ## Maintainers
 
-| Maintainer | Focus |
-|------------|-------|
-| [@re-bin](https://github.com/re-bin) | Project lead, `main` branch |
-| [@chengyongru](https://github.com/chengyongru) | `nightly` branch, experimental features |
+Maintainers are community stewards who help review, organize, and maintain the project. The list below describes each maintainer's current open-source project responsibilities.
 
-## Branching Strategy
+| Maintainer | Role |
+|------------|------|
+| [@re-bin](https://github.com/re-bin) | Project lead; reviews community PRs and handles merges |
+| [@chengyongru](https://github.com/chengyongru) | Reviews community PRs and may approve them; merges are handled by the project lead |
 
-We use a two-branch model to balance stability and exploration:
+## Contribution Flow
 
-| Branch | Purpose | Stability |
-|--------|---------|-----------|
-| `main` | Stable releases | Production-ready |
-| `nightly` | Experimental features | May have bugs or breaking changes |
+### What Should I Open a PR For?
 
-### Which Branch Should I Target?
-
-**Target `nightly` if your PR includes:**
+PRs are welcome for:
 
 - New features or functionality
-- Refactoring that may affect existing behavior
-- Changes to APIs or configuration
-
-**Target `main` if your PR includes:**
-
 - Bug fixes with no behavior changes
 - Documentation improvements
 - Minor tweaks that don't affect functionality
+- Refactoring that is clearly scoped and easy to review
+- Changes to APIs or configuration, when the impact is documented
 
-**When in doubt, target `nightly`.** It is easier to move a stable idea from `nightly`
-to `main` than to undo a risky change after it lands in the stable branch.
+For riskier or larger changes, please open an issue or draft PR early so the
+shape of the work can be discussed before the implementation grows too large.
 
 ### Starting Work
 
-Before making changes, sync the target branch and create a topic branch from it.
-For stable bug fixes and documentation-only changes, start from the latest `main`.
-For experimental work, start from the latest `nightly`.
+Before making changes, sync your local checkout and create a topic branch.
 
 ```bash
 git fetch upstream
@@ -62,28 +52,6 @@ uses a different remote name.
 Keep unrelated local changes out of the topic branch. If your checkout already has
 work in progress, use a separate worktree or finish that work before starting a
 new branch.
-
-### How Does Nightly Get Merged to Main?
-
-We don't merge the entire `nightly` branch. Instead, stable features are **cherry-picked** from `nightly` into individual PRs targeting `main`:
-
-```
-nightly  ──┬── feature A (stable) ──► PR ──► main
-           ├── feature B (testing)
-           └── feature C (stable) ──► PR ──► main
-```
-
-This happens approximately **once a week**, but the timing depends on when features become stable enough.
-
-### Quick Summary
-
-| Your Change | Target Branch |
-|-------------|---------------|
-| New feature | `nightly` |
-| Bug fix | `main` |
-| Documentation | `main` |
-| Refactoring | `nightly` |
-| Unsure | `nightly` |
 
 ## Development Setup
 
@@ -104,11 +72,25 @@ pytest
 ruff check nanobot/
 
 # Format code — optional. The existing tree predates `ruff format`,
-# so running it across `nanobot/` produces a large unrelated diff
-# (E501 is ignored, so many existing lines exceed the 100-char setting).
-# Format only files you've actually touched, not the whole package.
+# so running it broadly produces large unrelated diffs.
+# Do not mix mechanical formatting churn into a functional PR.
+# Use formatting only for the exact code your change intentionally touches.
 ruff format <files-you-changed>
 ```
+
+### Strict Type Checking
+
+Strict type checking covers optional providers and channels. Reproduce the CI environment
+with the same dependency sources and commands:
+
+```bash
+uv sync --all-extras --dev
+uv run --no-sync python -m scripts.install_channel_dependencies --all-channels
+uv run --no-sync basedpyright
+```
+
+Keep `--no-sync` on the final commands: channel dependencies come from their package
+manifests and are installed explicitly by the setup step.
 
 ## Contribution License
 
@@ -135,6 +117,9 @@ In practice:
 - Async: uses `asyncio` throughout; pytest with `asyncio_mode = "auto"`
 - Prefer readable code over magical code
 - Prefer focused patches over broad rewrites
+- Do not mix mechanical formatting, line wrapping, import sorting, or quote churn
+  into a feature or bugfix PR. If formatting cleanup is needed, make it a
+  separate formatting-only PR.
 - If a new abstraction is introduced, it should clearly reduce complexity rather than move it around
 
 ## Modifying CI Workflows
@@ -150,6 +135,44 @@ GitHub Actions' free tier:
 
 If your change genuinely needs to step outside this, please call it out
 explicitly in the PR description so it can be discussed before merge.
+
+## Release Packaging Contract
+
+Use the [release checklist](./docs/releasing.md) for candidate preparation, package checks,
+documentation coordination, and the final publication handoff.
+
+A stable install must never combine Python from one version with a TUI from another. Publish in
+this order:
+
+1. Before pushing a tag, set the package version, verify the exact candidate, build the source
+   distribution, all five platform wheels and TUI archives, and review licenses, source offer, and relinking
+   materials. Obtain the maintainer's source-offer commitment before publication.
+2. Merge the release preparation, verify that its packaged sources match the checked candidate,
+   then publish the matching GitHub release tag (`vX.Y.Z`). Recheck any changed sources first.
+3. Attach the preverified TUI archives and checksums to the matching GitHub Release. Alternatively,
+   manually run **Publish Terminal UI** for the exact tag with the compliance review confirmed;
+   reverify its outputs, since a rebuild does not preserve the preflight artifact hashes.
+4. Verify every platform archive and checksum is publicly downloadable for fallback/source-built
+   installations, then publish the same `X.Y.Z` source distribution and five platform wheels to PyPI.
+
+Each platform wheel contains the built WebUI and the matching native TUI. Pip chooses the wheel
+for the user's machine; launching the installed TUI must work without a GitHub download or Bun.
+The universal wheel produced by `uv build` is only an intermediate: use
+`scripts/build_tui_wheels.py` as described in the checklist, and do not upload that intermediate.
+The source distribution remains platform-neutral and does not bundle native binaries.
+Keep the platform-specific release archives for fallback/source-built installations. Both the
+wheel's `nanobot/tui/bin/` bundle and its matching archive must contain the executable,
+target-specific third-party notices, project and runtime licenses, corresponding application
+source, a written source offer, relinking instructions, and a checksum manifest. Never upload a
+naked TUI executable. Review the minimum OS, libc, architecture and runtime CPU requirements
+when changing Bun/OpenTUI; never apply portable platform tags without checking their binaries.
+Source checkouts use an editable Python install, run `tui/` with Bun, and
+rebuild stale `webui/` assets locally.
+
+The confirmation is an operational commitment, not a cosmetic checkbox. Before accepting it,
+verify that the exact Bun/WebKit revisions remain retrievable and that the project can honor the
+archive's corresponding-source offer for its full stated period. Preserve published archives and
+their source materials.
 
 ## Questions?
 

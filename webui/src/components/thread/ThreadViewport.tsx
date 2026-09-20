@@ -1,7 +1,9 @@
 import {
+  forwardRef,
   type ReactNode,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -10,27 +12,121 @@ import {
 import { ArrowDown } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { PromptRail } from "@/components/thread/PromptRail";
 import { ThreadMessages } from "@/components/thread/ThreadMessages";
 import { isAgentActivityMember } from "@/components/thread/AgentActivityCluster";
+import { ThreadCameraController } from "@/components/thread/thread-camera";
+import {
+  ThreadMotionCoordinator,
+  type ThreadMotionGeometry,
+} from "@/components/thread/thread-motion";
 import { Button } from "@/components/ui/button";
+import {
+  findPromptElement,
+  promptTop,
+} from "@/components/thread/promptNavigation";
 import { cn } from "@/lib/utils";
-import type { UIMessage } from "@/lib/types";
+import type { CliAppInfo, McpPresetInfo, RetryStatus, SlashCommand, UIMessage } from "@/lib/types";
+
+export interface ThreadViewportHandle {
+  jumpToUserPrompt: (promptId: string) => void;
+  cancelAutoScroll: () => void;
+}
 
 interface ThreadViewportProps {
   messages: UIMessage[];
+  temporary?: boolean;
   isStreaming: boolean;
-  composer: ReactNode;
+  /** Optimistic or canonical start time for the active turn, in unix seconds. */
+  runStartedAt?: number | null;
+  retryStatus?: RetryStatus | null;
+  composer?: ReactNode;
   emptyState?: ReactNode;
   scrollToBottomSignal?: number;
+  activeTurnId?: string | null;
+  activeTurnStartedHere?: boolean;
   conversationKey?: string | null;
+  conversationReady?: boolean;
   showScrollToBottomButton?: boolean;
+  cliApps?: CliAppInfo[];
+  mcpPresets?: McpPresetInfo[];
+  slashCommands?: SlashCommand[];
+  forkBoundaryMessageCount?: number | null;
+  hasMoreBefore?: boolean;
+  loadingOlder?: boolean;
+  userMessageOffset?: number;
+  onLoadOlder?: () => Promise<void> | void;
+  traceDetailScope?: string | null;
+  onLoadTraceDetails?: (refs: string[]) => void | Promise<void>;
+  onOpenFilePreview?: (path: string) => void;
+  onForkFromMessage?: (beforeUserIndex: number) => void;
+  onQuoteSelection?: (text: string) => void;
 }
 
 const NEAR_BOTTOM_PX = 48;
+const PROMPT_TOP_INSET_PX = 48;
+const HISTORY_PREFETCH_MIN_PX = 160;
+const HISTORY_PREFETCH_MAX_PX = 480;
 const DEFAULT_SCROLL_BUTTON_BOTTOM_PX = 192;
+const EXTERNAL_COMPOSER_SCROLL_BUTTON_BOTTOM_PX = 16;
 const SCROLL_BUTTON_COMPOSER_GAP_PX = 16;
-export const INITIAL_HISTORY_WINDOW = 160;
+const SOFT_KEYBOARD_MIN_INSET_PX = 80;
+const SESSION_HANDOFF_EXIT_DURATION_MS = 80;
+const SESSION_HANDOFF_ENTER_DURATION_MS = 140;
+const SESSION_HANDOFF_OPACITY = 0.82;
+export const INITIAL_HISTORY_WINDOW = 120;
 export const HISTORY_WINDOW_INCREMENT = 120;
+
+interface HistoryScrollAnchor {
+  key: string;
+  offsetTop: number;
+}
+
+const THREAD_DISPLAY_UNIT_SELECTOR = "[data-thread-display-unit]";
+
+function promptTopInset(scroller: HTMLElement): number {
+  const padding = Number.parseFloat(getComputedStyle(scroller).paddingTop);
+  return Number.isFinite(padding) ? padding : PROMPT_TOP_INSET_PX;
+}
+
+function historyPrefetchDistance(scroller: HTMLElement): number {
+  return Math.min(
+    HISTORY_PREFETCH_MAX_PX,
+    Math.max(HISTORY_PREFETCH_MIN_PX, scroller.clientHeight / 2),
+  );
+}
+
+function visibleHistoryUnit(
+  content: HTMLElement,
+  viewport: DOMRect,
+): HTMLElement | null {
+  // Scroll is a hot path. Hit-testing keeps the common case O(1) instead of
+  // forcing layout for every mounted message while the trackpad is moving.
+  if (typeof document.elementsFromPoint === "function" && viewport.height > 0) {
+    const contentBounds = content.getBoundingClientRect();
+    const left = Math.max(viewport.left, contentBounds.left);
+    const right = Math.min(viewport.right, contentBounds.right);
+    const x = left + Math.max(0, right - left) / 2;
+    const offsets = [1, Math.min(32, viewport.height / 3), viewport.height / 2];
+    for (const offset of offsets) {
+      for (const target of document.elementsFromPoint(x, viewport.top + offset)) {
+        const unit = target instanceof Element
+          ? target.closest<HTMLElement>(THREAD_DISPLAY_UNIT_SELECTOR)
+          : null;
+        if (unit && content.contains(unit)) return unit;
+      }
+    }
+  }
+
+  // Deterministic fallback for pre-layout states, tests, and older browsers.
+  const units = Array.from(
+    content.querySelectorAll<HTMLElement>(THREAD_DISPLAY_UNIT_SELECTOR),
+  );
+  return units.find((unit) => {
+    const bounds = unit.getBoundingClientRect();
+    return bounds.bottom > viewport.top && bounds.top < viewport.bottom;
+  }) ?? units[0] ?? null;
+}
 
 export function windowMessages(messages: UIMessage[], visibleCount: number): UIMessage[] {
   if (messages.length <= visibleCount) return messages;
@@ -45,259 +141,868 @@ export function windowMessages(messages: UIMessage[], visibleCount: number): UIM
   return messages.slice(start);
 }
 
-export function ThreadViewport({
+function isKeyboardEditableElement(element: Element | null): element is HTMLElement {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element.isContentEditable) return true;
+  if (element instanceof HTMLTextAreaElement) return true;
+  if (!(element instanceof HTMLInputElement)) return false;
+  return ![
+    "button",
+    "checkbox",
+    "color",
+    "file",
+    "hidden",
+    "image",
+    "radio",
+    "range",
+    "reset",
+    "submit",
+  ].includes(element.type);
+}
+
+function isThreadDisclosureTarget(target: EventTarget | null): boolean {
+  return target instanceof Element
+    && target.closest("[data-thread-disclosure]") !== null;
+}
+
+function isKeyboardControl(element: Element | null): boolean {
+  return element instanceof HTMLElement
+    && element.closest(
+      "button, a[href], select, [role='button'], [role='menuitem'], [role='option']",
+    ) !== null;
+}
+
+type ThreadScrollDirection = "backward" | "forward";
+
+const KEYBOARD_SCROLL_DIRECTIONS: Readonly<
+  Partial<Record<string, ThreadScrollDirection>>
+> = {
+  ArrowUp: "backward",
+  PageUp: "backward",
+  Home: "backward",
+  ArrowDown: "forward",
+  PageDown: "forward",
+  End: "forward",
+};
+
+function directionFromDelta(deltaY: number): ThreadScrollDirection | null {
+  return deltaY < 0 ? "backward" : deltaY > 0 ? "forward" : null;
+}
+
+function keyboardScrollDirection(
+  event: KeyboardEvent,
+): ThreadScrollDirection | null {
+  if (event.key === " ") {
+    return event.shiftKey ? "backward" : "forward";
+  }
+  return KEYBOARD_SCROLL_DIRECTIONS[event.key] ?? null;
+}
+
+function canScrollInDirection(
+  element: HTMLElement,
+  direction: ThreadScrollDirection | null,
+): boolean {
+  switch (direction) {
+    case "backward":
+      return element.scrollTop > 0;
+    case "forward":
+      return (
+        element.scrollTop
+        < Math.max(0, element.scrollHeight - element.clientHeight)
+      );
+    default:
+      return false;
+  }
+}
+
+function readSoftKeyboardInsetBottom(container: HTMLElement | null): number {
+  const viewport = window.visualViewport;
+  if (!viewport) return 0;
+  const active = document.activeElement;
+  if (!isKeyboardEditableElement(active) || !container?.contains(active)) return 0;
+  const layoutHeight = window.innerHeight || document.documentElement.clientHeight;
+  const inset = layoutHeight - viewport.height - viewport.offsetTop;
+  return inset >= SOFT_KEYBOARD_MIN_INSET_PX ? Math.ceil(inset) : 0;
+}
+
+export const ThreadViewport = forwardRef<ThreadViewportHandle, ThreadViewportProps>(function ThreadViewport({
   messages,
+  temporary = false,
   isStreaming,
+  runStartedAt = null,
+  retryStatus = null,
   composer,
   emptyState,
   scrollToBottomSignal = 0,
+  activeTurnId = null,
+  activeTurnStartedHere = false,
   conversationKey = null,
+  conversationReady = true,
   showScrollToBottomButton = true,
-}: ThreadViewportProps) {
+  cliApps = [],
+  mcpPresets = [],
+  slashCommands = [],
+  forkBoundaryMessageCount = null,
+  hasMoreBefore = false,
+  loadingOlder = false,
+  userMessageOffset = 0,
+  onLoadOlder,
+  traceDetailScope = null,
+  onLoadTraceDetails,
+  onOpenFilePreview,
+  onForkFromMessage,
+  onQuoteSelection,
+}, ref) {
   const { t } = useTranslation();
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const viewportFrameRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const messageRegionRef = useRef<HTMLDivElement>(null);
+  const messageContentRef = useRef<HTMLDivElement>(null);
+  const emptyStateRef = useRef<HTMLDivElement>(null);
   const composerDockRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const lastConversationKeyRef = useRef<string | null>(conversationKey);
+  const conversationHandoffPendingRef = useRef(false);
+  const conversationHandoffAnimationRef = useRef<Animation | null>(null);
   const pendingConversationScrollRef = useRef(true);
-  const scrollFrameIdsRef = useRef<number[]>([]);
+  const pendingPromptJumpRef = useRef<string | null>(null);
   const restoreScrollAfterPrependRef =
     useRef<{ height: number; top: number } | null>(null);
-  /** User scrolled away from the bottom; do not auto-yank until they return or we reset (new chat / send). */
-  const userReadingHistoryRef = useRef(false);
+  const historyScrollAnchorRef = useRef<HistoryScrollAnchor | null>(null);
+  const composerInputScrollTopRef = useRef<number | null>(null);
+  const composerDockHeightRef = useRef(0);
   const [atBottom, setAtBottom] = useState(true);
   const [composerDockHeight, setComposerDockHeight] = useState(0);
+  const [keyboardInsetBottom, setKeyboardInsetBottom] = useState(0);
+  const [hasVerticalOverflow, setHasVerticalOverflow] = useState(false);
   const [visibleMessageCount, setVisibleMessageCount] =
     useState(INITIAL_HISTORY_WINDOW);
+  const threadMotionRef = useRef<ThreadMotionCoordinator | null>(null);
+  if (threadMotionRef.current === null) {
+    const camera = new ThreadCameraController(() => scrollRef.current);
+    threadMotionRef.current = new ThreadMotionCoordinator({
+      camera,
+      measure: (promptId) => {
+        const scrollEl = scrollRef.current;
+        const composerDock = composerDockRef.current;
+        if (!scrollEl) return null;
+        const composerHeight = composerDock
+          ? composerDock.getBoundingClientRect().height || composerDock.offsetHeight
+          : 0;
+        const prompt = promptId ? findPromptElement(scrollEl, promptId) : null;
+        const scrollHeight = scrollEl.scrollHeight;
+        const clientHeight = scrollEl.clientHeight;
+        const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
+        return {
+          scrollTop: scrollEl.scrollTop,
+          scrollHeight,
+          clientHeight,
+          maxScrollTop,
+          composerHeight,
+          promptTop: prompt
+            ? Math.min(
+                maxScrollTop,
+                Math.max(0, promptTop(scrollEl, prompt) - promptTopInset(scrollEl)),
+              )
+            : null,
+        };
+      },
+      onGeometry: (geometry: ThreadMotionGeometry) => {
+        if (Math.abs(composerDockHeightRef.current - geometry.composerHeight) >= 1) {
+          composerDockHeightRef.current = geometry.composerHeight;
+          setComposerDockHeight(geometry.composerHeight);
+        }
+        const nextOverflow = geometry.scrollHeight > geometry.clientHeight + 1;
+        setHasVerticalOverflow((current) =>
+          current === nextOverflow ? current : nextOverflow,
+        );
+      },
+      onAutoFollow: () => setAtBottom(true),
+    });
+  }
   const hasMessages = messages.length > 0;
+  useLayoutEffect(() => {
+    scrollRef.current = hasMessages
+      ? messageRegionRef.current
+      : viewportFrameRef.current;
+  }, [hasMessages]);
   const visibleMessages = useMemo(
     () => windowMessages(messages, visibleMessageCount),
     [messages, visibleMessageCount],
   );
   const hiddenMessageCount = messages.length - visibleMessages.length;
-  const scrollButtonBottom = composerDockHeight > 0
-    ? composerDockHeight + SCROLL_BUTTON_COMPOSER_GAP_PX
-    : DEFAULT_SCROLL_BUTTON_BOTTOM_PX;
+  const hiddenUserMessageCount =
+    userMessageOffset
+    + (hiddenMessageCount > 0
+      ? messages.slice(0, hiddenMessageCount).filter(
+        (message) => message.role === "user" && message.deliveryStatus !== "failed",
+      ).length
+      : 0);
+  const visibleForkBoundaryMessageCount =
+    forkBoundaryMessageCount !== null && forkBoundaryMessageCount > hiddenMessageCount
+      ? forkBoundaryMessageCount - hiddenMessageCount
+      : null;
+  const hasComposer = composer !== null && composer !== undefined;
+  const scrollButtonBottom =
+    keyboardInsetBottom
+    + (composerDockHeight > 0
+      ? composerDockHeight + SCROLL_BUTTON_COMPOSER_GAP_PX
+      : hasComposer
+        ? DEFAULT_SCROLL_BUTTON_BOTTOM_PX
+        : EXTERNAL_COMPOSER_SCROLL_BUTTON_BOTTOM_PX);
+  const scrollViewportStyle =
+    keyboardInsetBottom > 0 ? { bottom: keyboardInsetBottom } : undefined;
 
-  const cancelScheduledBottomScroll = useCallback(() => {
-    for (const id of scrollFrameIdsRef.current) {
-      window.cancelAnimationFrame(id);
+  const yieldCameraToUser = useCallback(() => {
+    threadMotionRef.current?.takeUserControl();
+  }, []);
+
+  const captureHistoryScrollAnchor = useCallback(() => {
+    const scroller = scrollRef.current;
+    const content = messageContentRef.current;
+    if (!scroller || !content) {
+      historyScrollAnchorRef.current = null;
+      return false;
     }
-    scrollFrameIdsRef.current = [];
+    const viewport = scroller.getBoundingClientRect();
+    const element = visibleHistoryUnit(content, viewport);
+    const key = element?.dataset.threadDisplayUnit;
+    if (!element || !key) {
+      historyScrollAnchorRef.current = null;
+      return false;
+    }
+    historyScrollAnchorRef.current = {
+      key,
+      offsetTop: element.getBoundingClientRect().top - viewport.top,
+    };
+    return true;
+  }, []);
+
+  const reconcileHistoryScrollAnchor = useCallback(() => {
+    const scroller = scrollRef.current;
+    const content = messageContentRef.current;
+    const anchor = historyScrollAnchorRef.current;
+    if (!scroller || !content || !anchor) return false;
+    const element = Array.from(
+      content.querySelectorAll<HTMLElement>("[data-thread-display-unit]"),
+    ).find((candidate) => candidate.dataset.threadDisplayUnit === anchor.key);
+    if (!element) {
+      historyScrollAnchorRef.current = null;
+      return false;
+    }
+
+    const nextOffset =
+      element.getBoundingClientRect().top
+      - scroller.getBoundingClientRect().top;
+    const delta = nextOffset - anchor.offsetTop;
+    if (Math.abs(delta) < 0.5) return true;
+    const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    const nextTop = Math.min(maxScrollTop, Math.max(0, scroller.scrollTop + delta));
+    threadMotionRef.current?.jumpTo(nextTop);
+    return true;
   }, []);
 
   const scrollToBottomNow = useCallback((smooth = false) => {
+    historyScrollAnchorRef.current = null;
     const el = scrollRef.current;
     const marker = bottomRef.current;
     const behavior: ScrollBehavior = smooth ? "smooth" : "auto";
-    if (marker) {
+    if (el) {
+      const top = Math.max(0, el.scrollHeight - el.clientHeight);
+      if (smooth) {
+        threadMotionRef.current?.navigateLatestTo(top);
+      } else {
+        threadMotionRef.current?.jumpTo(top);
+      }
+    } else if (marker) {
       marker.scrollIntoView({ block: "end", behavior });
-    } else if (el) {
-      el.scrollTo({ top: el.scrollHeight, behavior });
     }
     setAtBottom(true);
   }, []);
 
   const scrollToBottom = useCallback(
-    (smooth = false, frames = 1, options?: { force?: boolean }) => {
+    (smooth = false, options?: { force?: boolean }) => {
       const force = options?.force ?? false;
-      cancelScheduledBottomScroll();
-      const run = () => {
-        if (!force && userReadingHistoryRef.current) return;
-        scrollToBottomNow(smooth);
-      };
-      run();
-      for (let i = 1; i < frames; i += 1) {
-        const id = window.requestAnimationFrame(() => {
-          if (!force && userReadingHistoryRef.current) return;
-          scrollToBottomNow(smooth);
-        });
-        scrollFrameIdsRef.current.push(id);
-      }
+      if (!force && threadMotionRef.current?.isAutoFollowPaused()) return;
+      if (!smooth) threadMotionRef.current?.resumeAutoFollow();
+      scrollToBottomNow(smooth);
     },
-    [cancelScheduledBottomScroll, scrollToBottomNow],
+    [scrollToBottomNow],
   );
 
   const loadEarlierMessages = useCallback(() => {
     const el = scrollRef.current;
     if (el) {
-      restoreScrollAfterPrependRef.current = {
-        height: el.scrollHeight,
-        top: el.scrollTop,
-      };
+      if (captureHistoryScrollAnchor()) {
+        restoreScrollAfterPrependRef.current = null;
+      } else {
+        restoreScrollAfterPrependRef.current = {
+          height: el.scrollHeight,
+          top: el.scrollTop,
+        };
+      }
     }
-    userReadingHistoryRef.current = true;
+    threadMotionRef.current?.takeUserControl();
     setAtBottom(false);
-    setVisibleMessageCount((count) =>
-      Math.min(messages.length, count + HISTORY_WINDOW_INCREMENT),
-    );
-  }, [messages.length]);
+    if (hiddenMessageCount > 0) {
+      setVisibleMessageCount((count) =>
+        Math.min(messages.length, count + HISTORY_WINDOW_INCREMENT),
+      );
+      return;
+    }
+    if (hasMoreBefore && onLoadOlder && !loadingOlder) {
+      setVisibleMessageCount((count) => count + HISTORY_WINDOW_INCREMENT);
+      void onLoadOlder();
+    }
+  }, [
+    captureHistoryScrollAnchor,
+    hasMoreBefore,
+    hiddenMessageCount,
+    loadingOlder,
+    messages.length,
+    onLoadOlder,
+  ]);
 
-  const measureComposerDock = useCallback(() => {
-    const el = composerDockRef.current;
-    if (!el) return;
-    const height = el.getBoundingClientRect().height || el.offsetHeight;
-    setComposerDockHeight((current) =>
-      Math.abs(current - height) < 1 ? current : height,
+  const maybeLoadEarlierFromScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el || !hasMessages || pendingConversationScrollRef.current) return;
+    if (!threadMotionRef.current?.isBrowsingHistory()) return;
+    if (el.scrollTop > historyPrefetchDistance(el)) return;
+    if (hiddenMessageCount <= 0 && !hasMoreBefore) return;
+    loadEarlierMessages();
+  }, [hasMessages, hasMoreBefore, hiddenMessageCount, loadEarlierMessages]);
+
+  const navigateToVisiblePrompt = useCallback((promptId: string) => {
+    const scrollEl = scrollRef.current;
+    const prompt = scrollEl ? findPromptElement(scrollEl, promptId) : null;
+    if (!scrollEl || !prompt) return false;
+    historyScrollAnchorRef.current = null;
+    setAtBottom(false);
+    const maxScrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+    threadMotionRef.current?.navigateHistoryTo(
+      Math.min(
+        maxScrollTop,
+        Math.max(0, promptTop(scrollEl, prompt) - promptTopInset(scrollEl)),
+      ),
     );
+    return true;
   }, []);
 
-  useEffect(() => {
-    if (!atBottom) return;
-    // Instant jump: CSS scroll-smooth + behavior "auto" still animates in some
-    // browsers; session switches and history hydration should never slide from top.
-    scrollToBottom(false);
-  }, [messages, atBottom, scrollToBottom]);
+  const jumpToUserPrompt = useCallback((promptId: string) => {
+    if (navigateToVisiblePrompt(promptId)) return;
+    const index = messages.findIndex((message) => message.id === promptId);
+    if (index < 0) return;
+    threadMotionRef.current?.takeUserControl();
+    pendingPromptJumpRef.current = promptId;
+    setAtBottom(false);
+    setVisibleMessageCount((count) => Math.max(count, messages.length - index));
+  }, [messages, navigateToVisiblePrompt]);
+
+  const cancelAutoScroll = useCallback(() => {
+    threadMotionRef.current?.takeUserControl();
+  }, []);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      jumpToUserPrompt,
+      cancelAutoScroll,
+    }),
+    [cancelAutoScroll, jumpToUserPrompt],
+  );
+
+  useLayoutEffect(() => {
+    const updateKeyboardInset = () => {
+      const composerDock = composerDockRef.current;
+      const next = readSoftKeyboardInsetBottom(composerDock);
+      const active = document.activeElement;
+      const composerFocused =
+        hasMessages
+        && isKeyboardEditableElement(active)
+        && Boolean(composerDock?.contains(active));
+      setKeyboardInsetBottom((current) =>
+        Math.abs(current - next) < 1 ? current : next,
+      );
+      if (composerFocused) {
+        // Focusing the composer establishes a new reference frame at the
+        // latest message. This is one immediate positioning command; viewport
+        // events may issue a fresh command, but no command survives into a
+        // later render as a train of retry frames.
+        scrollToBottom(false, { force: true });
+      }
+    };
+    updateKeyboardInset();
+    const viewport = window.visualViewport;
+    viewport?.addEventListener("resize", updateKeyboardInset);
+    viewport?.addEventListener("scroll", updateKeyboardInset);
+    window.addEventListener("resize", updateKeyboardInset);
+    document.addEventListener("focusin", updateKeyboardInset);
+    document.addEventListener("focusout", updateKeyboardInset);
+    return () => {
+      viewport?.removeEventListener("resize", updateKeyboardInset);
+      viewport?.removeEventListener("scroll", updateKeyboardInset);
+      window.removeEventListener("resize", updateKeyboardInset);
+      document.removeEventListener("focusin", updateKeyboardInset);
+      document.removeEventListener("focusout", updateKeyboardInset);
+    };
+  }, [hasMessages, scrollToBottom]);
 
   useEffect(() => {
     if (scrollToBottomSignal <= 0) return;
-    userReadingHistoryRef.current = false;
-    scrollToBottom(false, 8);
+    scrollToBottom(false, { force: true });
   }, [scrollToBottomSignal, scrollToBottom]);
 
   useLayoutEffect(() => {
     if (lastConversationKeyRef.current === conversationKey) return;
     lastConversationKeyRef.current = conversationKey;
+    conversationHandoffAnimationRef.current?.cancel();
+    conversationHandoffAnimationRef.current = null;
+    conversationHandoffPendingRef.current = true;
     pendingConversationScrollRef.current = true;
-    userReadingHistoryRef.current = false;
+    historyScrollAnchorRef.current = null;
+    restoreScrollAfterPrependRef.current = null;
+    threadMotionRef.current?.reset();
     setAtBottom(true);
     setVisibleMessageCount(INITIAL_HISTORY_WINDOW);
-  }, [conversationKey]);
+
+    const surface = hasMessages ? messageRegionRef.current : emptyStateRef.current;
+    const reduceMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!surface || reduceMotion || typeof surface.animate !== "function") return;
+    conversationHandoffAnimationRef.current = surface.animate(
+      [{ opacity: 1 }, { opacity: SESSION_HANDOFF_OPACITY }],
+      {
+        duration: SESSION_HANDOFF_EXIT_DURATION_MS,
+        easing: "cubic-bezier(0.2, 0, 0, 1)",
+        fill: "forwards",
+      },
+    );
+  }, [conversationKey, hasMessages]);
+
+  useLayoutEffect(() => {
+    if (!conversationReady) {
+      threadMotionRef.current?.reset();
+      return;
+    }
+    if (!activeTurnId) {
+      threadMotionRef.current?.completeTurn();
+      return;
+    }
+
+    const promptIndex = messages.findIndex(
+      (message) => message.role === "user" && message.turnId === activeTurnId,
+    );
+    if (
+      activeTurnStartedHere
+      && promptIndex >= 0
+      && threadMotionRef.current?.snapshot().turnId !== activeTurnId
+    ) {
+      // A turn submitted in this mounted viewport establishes a new prompt
+      // origin. A restored turn must first complete open-at-bottom instead.
+      pendingConversationScrollRef.current = false;
+    }
+    const prompt = promptIndex >= 0 ? messages[promptIndex] : null;
+    const hasOutput = promptIndex >= 0
+      ? messages
+          .slice(promptIndex + 1)
+          .some(
+            (message) =>
+              message.role !== "user"
+              && (!message.turnId || message.turnId === activeTurnId),
+          )
+      : !activeTurnStartedHere && messages.some(
+          (message) =>
+            message.role !== "user" && message.turnId === activeTurnId,
+        );
+    threadMotionRef.current?.updateTurn({
+      id: activeTurnId,
+      promptId: prompt?.id ?? null,
+      hasOutput,
+      entry: activeTurnStartedHere ? "submitted" : "restored",
+    });
+  }, [activeTurnId, activeTurnStartedHere, conversationReady, messages]);
 
   useLayoutEffect(() => {
     const pending = restoreScrollAfterPrependRef.current;
-    if (!pending) return;
     const el = scrollRef.current;
     restoreScrollAfterPrependRef.current = null;
     if (!el) return;
+    if (reconcileHistoryScrollAnchor()) return;
+    if (!pending) return;
     const delta = el.scrollHeight - pending.height;
-    el.scrollTop = pending.top + delta;
-  }, [visibleMessages.length]);
+    const nextTop = Math.min(
+      Math.max(0, el.scrollHeight - el.clientHeight),
+      Math.max(0, pending.top + delta),
+    );
+    threadMotionRef.current?.jumpTo(nextTop);
+  }, [reconcileHistoryScrollAnchor, visibleMessages.length, messages.length]);
+
+  useLayoutEffect(() => {
+    const promptId = pendingPromptJumpRef.current;
+    const scrollEl = scrollRef.current;
+    if (!promptId || !scrollEl || !findPromptElement(scrollEl, promptId)) return;
+    pendingPromptJumpRef.current = null;
+    const frame = window.requestAnimationFrame(() => navigateToVisiblePrompt(promptId));
+    return () => window.cancelAnimationFrame(frame);
+  }, [navigateToVisiblePrompt, visibleMessages.length]);
 
   useLayoutEffect(() => {
     if (!pendingConversationScrollRef.current) return;
+    if (!conversationReady) return;
     if (!conversationKey) {
       pendingConversationScrollRef.current = false;
-      scrollToBottom(false, 4);
+      scrollToBottom(false, { force: true });
       return;
     }
-    scrollToBottom(false, 8);
+    scrollToBottom(false, { force: true });
     if (!hasMessages) return;
     pendingConversationScrollRef.current = false;
-  }, [conversationKey, hasMessages, messages, scrollToBottom]);
+  }, [
+    conversationKey,
+    conversationReady,
+    hasMessages,
+    messages,
+    scrollToBottom,
+  ]);
 
   useLayoutEffect(() => {
-    measureComposerDock();
-  }, [composer, hasMessages, measureComposerDock]);
+    if (!conversationReady || !conversationHandoffPendingRef.current) return;
+    conversationHandoffPendingRef.current = false;
+    conversationHandoffAnimationRef.current?.cancel();
+    conversationHandoffAnimationRef.current = null;
+    const surface = hasMessages ? messageRegionRef.current : emptyStateRef.current;
+    const reduceMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!surface || reduceMotion || typeof surface.animate !== "function") return;
 
-  useEffect(() => cancelScheduledBottomScroll, [cancelScheduledBottomScroll]);
+    const animation = surface.animate(
+      [{ opacity: SESSION_HANDOFF_OPACITY }, { opacity: 1 }],
+      {
+        duration: SESSION_HANDOFF_ENTER_DURATION_MS,
+        easing: "cubic-bezier(0.2, 0, 0, 1)",
+      },
+    );
+    conversationHandoffAnimationRef.current = animation;
+    const clearAnimation = () => {
+      if (conversationHandoffAnimationRef.current === animation) {
+        conversationHandoffAnimationRef.current = null;
+      }
+    };
+    animation.onfinish = clearAnimation;
+    animation.oncancel = clearAnimation;
+  }, [conversationReady, hasMessages]);
 
-  useEffect(() => {
-    const target = contentRef.current;
-    if (!target || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => {
-      if (userReadingHistoryRef.current) return;
-      scrollToBottom(false, 4);
-    });
-    observer.observe(target);
-    return () => observer.disconnect();
-  }, [hasMessages, scrollToBottom]);
+  useLayoutEffect(() => {
+    threadMotionRef.current?.invalidateGeometry();
+  }, [composer, hasMessages, visibleMessages.length]);
 
-  useEffect(() => {
-    const target = composerDockRef.current;
-    if (!target || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measureComposerDock());
-    observer.observe(target);
-    return () => observer.disconnect();
-  }, [hasMessages, measureComposerDock]);
+  useEffect(() => () => {
+    conversationHandoffAnimationRef.current?.cancel();
+    threadMotionRef.current?.dispose();
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const content = contentRef.current;
+    const messageRegion = messageRegionRef.current;
+    const messageContent = messageContentRef.current;
+    const composerDock = composerDockRef.current;
+    if (!el) return;
+
+    const invalidateGeometry = () => {
+      threadMotionRef.current?.invalidateGeometry();
+    };
+    const reconcileObservedGeometry = () => {
+      reconcileHistoryScrollAnchor();
+      threadMotionRef.current?.reconcileObservedGeometry();
+    };
+    reconcileObservedGeometry();
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(reconcileObservedGeometry);
+    observer?.observe(el);
+    if (content) observer?.observe(content);
+    if (messageRegion) observer?.observe(messageRegion);
+    if (messageContent) observer?.observe(messageContent);
+    if (composerDock) observer?.observe(composerDock);
+    window.addEventListener("resize", invalidateGeometry);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", invalidateGeometry);
+    };
+  }, [hasMessages, reconcileHistoryScrollAnchor]);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
 
-    const onScroll = () => {
+    const onScroll = (allowHistoryLoad = true) => {
       const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
       const near = distance < NEAR_BOTTOM_PX;
-      setAtBottom(near);
-      userReadingHistoryRef.current = !near;
+      const owner = threadMotionRef.current?.observeScroll(near) ?? "automatic";
+      const logicallyAtBottom = owner === "automatic" || (owner === "navigation" && near);
+      setAtBottom((current) =>
+        current === logicallyAtBottom ? current : logicallyAtBottom,
+      );
+      if (owner === "user") {
+        captureHistoryScrollAnchor();
+        if (allowHistoryLoad) maybeLoadEarlierFromScroll();
+      } else if (near) {
+        historyScrollAnchorRef.current = null;
+      }
     };
 
-    onScroll();
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, []);
+    onScroll(false);
+    const handleScroll = () => onScroll(true);
+    const handleDirectionalInput = (
+      direction: ThreadScrollDirection | null,
+    ) => {
+      if (!direction) return;
+      threadMotionRef.current?.handleUserScrollIntent(
+        canScrollInDirection(el, direction),
+        direction === "forward",
+      );
+    };
+    const handleWheel = (event: WheelEvent) => {
+      if (
+        event.defaultPrevented
+        || event.ctrlKey
+        || Math.abs(event.deltaY) <= Math.abs(event.deltaX)
+      ) {
+        return;
+      }
+      handleDirectionalInput(directionFromDelta(event.deltaY));
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      if (
+        event.button === 0
+        && (event.target === el || isThreadDisclosureTarget(event.target))
+      ) {
+        yieldCameraToUser();
+      }
+    };
+    let lastTouchY: number | null = null;
+    const handleTouchStart = (event: TouchEvent) => {
+      lastTouchY = event.touches[0]?.clientY ?? null;
+    };
+    const handleTouchMove = (event: TouchEvent) => {
+      const currentY = event.touches[0]?.clientY;
+      const scrollDeltaY =
+        lastTouchY !== null && currentY !== undefined
+          ? lastTouchY - currentY
+          : 0;
+      lastTouchY = currentY ?? null;
+      handleDirectionalInput(directionFromDelta(scrollDeltaY));
+    };
+    const handleTouchEnd = () => {
+      lastTouchY = null;
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented
+        || event.altKey
+        || event.ctrlKey
+        || event.metaKey
+        || isKeyboardEditableElement(event.target as Element | null)
+      ) {
+        return;
+      }
+      if (
+        (event.key === "Enter" || event.key === " ")
+        && isThreadDisclosureTarget(event.target)
+      ) {
+        yieldCameraToUser();
+        return;
+      }
+      if (isKeyboardControl(event.target as Element | null)) return;
+      handleDirectionalInput(keyboardScrollDirection(event));
+    };
+    el.addEventListener("scroll", handleScroll, { passive: true });
+    el.addEventListener("wheel", handleWheel, { passive: true });
+    el.addEventListener("touchstart", handleTouchStart, { passive: true });
+    el.addEventListener("touchmove", handleTouchMove, { passive: true });
+    el.addEventListener("touchend", handleTouchEnd, { passive: true });
+    el.addEventListener("touchcancel", handleTouchEnd, { passive: true });
+    el.addEventListener("pointerdown", handlePointerDown);
+    el.addEventListener("keydown", handleKeyDown);
+    return () => {
+      el.removeEventListener("scroll", handleScroll);
+      el.removeEventListener("wheel", handleWheel);
+      el.removeEventListener("touchstart", handleTouchStart);
+      el.removeEventListener("touchmove", handleTouchMove);
+      el.removeEventListener("touchend", handleTouchEnd);
+      el.removeEventListener("touchcancel", handleTouchEnd);
+      el.removeEventListener("pointerdown", handlePointerDown);
+      el.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [
+    captureHistoryScrollAnchor,
+    hasMessages,
+    maybeLoadEarlierFromScroll,
+    yieldCameraToUser,
+  ]);
 
   return (
-    <div className="relative flex min-h-0 flex-1 overflow-hidden">
+    <div className="thread-viewport relative flex min-h-0 flex-1 overflow-hidden">
       <div
-        ref={scrollRef}
+        ref={viewportFrameRef}
         className={cn(
-          "absolute inset-0 overflow-y-auto scroll-auto scrollbar-thin",
-          "[&::-webkit-scrollbar]:w-1.5",
-          "[&::-webkit-scrollbar-thumb]:rounded-full",
-          "[&::-webkit-scrollbar-thumb]:bg-muted-foreground/30",
-          "[&::-webkit-scrollbar-track]:bg-transparent",
+          "thread-viewport-frame absolute inset-0",
+          hasMessages
+            ? "overflow-hidden"
+            : cn(
+                "thread-viewport-scrollbar scroll-auto",
+                "[overflow-anchor:none] [scrollbar-width:none]",
+                "[&::-webkit-scrollbar]:hidden",
+                hasVerticalOverflow ? "overflow-y-auto" : "overflow-hidden",
+              ),
         )}
+        style={scrollViewportStyle}
       >
-        {hasMessages ? (
-          <div ref={contentRef} className="mx-auto flex min-h-full w-full max-w-[64rem] flex-col">
-            <div className="flex-1 px-4 pb-20 pt-4">
-              <div className="mx-auto w-full max-w-[49.5rem]">
+        <div
+          ref={contentRef}
+          data-testid={!hasMessages ? "thread-welcome-layout" : undefined}
+          data-layout={hasComposer ? (hasMessages ? "thread" : "hero") : "external"}
+          className={cn(
+            "thread-layout mx-auto grid min-h-full w-full",
+            hasMessages
+              ? "h-full max-w-[64rem]"
+              : "max-w-[72rem] px-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] pt-6 sm:px-4 sm:py-12",
+          )}
+        >
+          {hasMessages ? (
+            <div
+              ref={messageRegionRef}
+              data-testid="thread-message-region"
+              className={cn(
+                "thread-message-viewport thread-viewport-scrollbar row-start-1 flex min-h-0 min-w-0 flex-col",
+                "scroll-auto justify-start overflow-x-hidden px-3 pb-0 pt-[var(--thread-prompt-inset,3rem)] sm:px-4",
+                "[overflow-anchor:none] [scrollbar-width:none]",
+                "[&::-webkit-scrollbar]:hidden",
+                hasVerticalOverflow ? "overflow-y-auto" : "overflow-hidden",
+              )}
+            >
+              <div ref={messageContentRef} className="mx-auto w-full max-w-[var(--content-column-width)]">
                 <ThreadMessages
                   messages={visibleMessages}
+                  temporary={temporary}
                   isStreaming={isStreaming}
-                  hiddenMessageCount={hiddenMessageCount}
-                  onLoadEarlier={loadEarlierMessages}
+                  activeTurnId={activeTurnId}
+                  runStartedAt={runStartedAt}
+                  retryStatus={retryStatus}
+                  hiddenUserMessageCount={hiddenUserMessageCount}
+                  cliApps={cliApps}
+                  mcpPresets={mcpPresets}
+                  slashCommands={slashCommands}
+                  forkBoundaryMessageCount={visibleForkBoundaryMessageCount}
+                  traceDetailScope={traceDetailScope}
+                  onLoadTraceDetails={onLoadTraceDetails}
+                  onOpenFilePreview={onOpenFilePreview}
+                  onForkFromMessage={onForkFromMessage}
+                  onQuoteSelection={onQuoteSelection}
                 />
               </div>
+              <div aria-hidden className="thread-message-end-gap shrink-0" />
+              <div ref={bottomRef} aria-hidden className="h-px shrink-0" />
             </div>
+          ) : (
+            <div
+              ref={emptyStateRef}
+              data-testid="thread-empty-region"
+              className={cn(
+                "row-start-1 flex min-h-0 min-w-0 w-full items-center justify-center",
+                hasComposer && "sm:items-end sm:pb-8",
+              )}
+            >
+              {emptyState}
+            </div>
+          )}
 
+          {hasComposer ? (
             <div
               ref={composerDockRef}
               data-testid="thread-composer-dock"
-              className="sticky bottom-0 z-10 mt-auto bg-background"
+              onInputCapture={(event) => {
+                if (event.target instanceof HTMLTextAreaElement) {
+                  composerInputScrollTopRef.current = scrollRef.current?.scrollTop ?? null;
+                  threadMotionRef.current?.handleComposerInput();
+                }
+              }}
+              onInput={(event) => {
+                if (!(event.target instanceof HTMLTextAreaElement)) return;
+                const previousScrollTop = composerInputScrollTopRef.current;
+                composerInputScrollTopRef.current = null;
+                const scrollEl = scrollRef.current;
+                if (scrollEl && previousScrollTop !== null) {
+                  // Textarea autosizing briefly collapses to `height: auto` while
+                  // measuring. Chrome can clamp the sibling thread scrollport in
+                  // that intermediate layout; restore it before paint, then let
+                  // ResizeObserver handle any real final composer height change.
+                  scrollEl.scrollTop = previousScrollTop;
+                }
+              }}
+              className={cn(
+                "row-start-2 z-10 w-full",
+                hasMessages ? "thread-composer-dock relative" : "relative self-center",
+              )}
             >
-              <div className="px-4 pb-3">
-                {composer}
+              <div
+                className={cn(
+                  hasMessages
+                    ? "px-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] sm:px-4"
+                    : "",
+                )}
+              >
+                <div
+                  data-testid="thread-composer-motion"
+                  className="mx-auto w-full max-w-[58rem]"
+                >
+                  {composer}
+                </div>
               </div>
             </div>
-          </div>
-        ) : (
-          <div ref={contentRef} className="mx-auto flex min-h-full w-full max-w-[72rem] flex-col px-4">
-            <div className="flex w-full flex-1 items-center justify-center pb-[7vh] pt-8">
-              <div className="flex w-full max-w-[58rem] flex-col gap-6">
-                {emptyState}
-                <div className="w-full">{composer}</div>
-              </div>
-            </div>
-          </div>
-        )}
-        <div ref={bottomRef} aria-hidden className="h-px" />
+          ) : null}
+
+          {hasComposer ? (
+            <div
+              aria-hidden
+              className="thread-layout-spacer row-start-3 min-h-0 overflow-hidden"
+            />
+          ) : null}
+        </div>
+        {!hasMessages ? <div ref={bottomRef} aria-hidden className="h-px" /> : null}
       </div>
 
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-x-0 top-0 h-6 bg-gradient-to-b from-background to-transparent"
-      />
+      {hasMessages ? (
+        <PromptRail
+          messages={visibleMessages}
+          scrollRef={scrollRef}
+          bottomOffset={scrollButtonBottom}
+          onJumpToPrompt={navigateToVisiblePrompt}
+        />
+      ) : null}
 
       {showScrollToBottomButton && !atBottom && (
-        <Button
-          variant="outline"
-          size="icon"
-          onClick={() => scrollToBottom(true, 1, { force: true })}
-          className={cn(
-            /* Keep clear of sticky composer (textarea + toolbar + optional goal strip). */
-            "absolute left-1/2 z-20 h-8 w-8 -translate-x-1/2 rounded-full shadow-md",
-            "bg-background/90 backdrop-blur",
-            "animate-in fade-in-0 zoom-in-95",
-          )}
+        <div
+          className="absolute left-1/2 z-20 -translate-x-1/2"
           style={{ bottom: scrollButtonBottom }}
-          aria-label={t("thread.scrollToBottom")}
         >
-          <ArrowDown className="h-4 w-4" />
-        </Button>
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => scrollToBottom(true, { force: true })}
+            className={cn(
+              "h-8 w-8 rounded-full shadow-md",
+              "bg-background/90 backdrop-blur",
+              "animate-in fade-in-0 zoom-in-95",
+            )}
+            aria-label={t("thread.scrollToBottom")}
+          >
+            <ArrowDown className="h-4 w-4" />
+          </Button>
+        </div>
       )}
     </div>
   );
-}
+});

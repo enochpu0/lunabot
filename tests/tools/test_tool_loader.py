@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.context import ToolContext
+from nanobot.agent.tools.loader import _SKIP_MODULES, ToolLoader
 
 
 class _MinimalTool(Tool):
@@ -51,15 +52,14 @@ def test_tool_plugin_discoverable_default_is_true():
 
 # --- ToolContext tests ---
 
-from nanobot.agent.tools.context import ToolContext
-
 
 def test_tool_context_has_required_fields():
     field_names = {f.name for f in fields(ToolContext)}
     required = {
         "config", "workspace", "bus", "subagent_manager",
-        "cron_service", "file_state_store", "provider_snapshot_loader",
-        "image_generation_provider_configs", "timezone",
+        "cron_service", "exec_session_manager", "file_state_store",
+        "provider_snapshot_loader", "image_generation_provider_configs", "timezone",
+        "runtime_control",
     }
     assert required <= field_names
 
@@ -69,14 +69,14 @@ def test_tool_context_defaults():
     assert ctx.bus is None
     assert ctx.subagent_manager is None
     assert ctx.cron_service is None
+    assert ctx.exec_session_manager is None
     assert ctx.provider_snapshot_loader is None
     assert ctx.image_generation_provider_configs is None
+    assert ctx.runtime_control is None
     assert ctx.timezone == "UTC"
 
 
 # --- ToolLoader tests ---
-
-from nanobot.agent.tools.loader import ToolLoader, _SKIP_MODULES
 
 
 def test_skip_modules_excludes_infrastructure():
@@ -89,9 +89,13 @@ def test_discover_finds_concrete_tools():
     loader = ToolLoader()
     discovered = loader.discover()
     class_names = {cls.__name__ for cls in discovered}
+    assert "ApplyPatchTool" in class_names
     assert "ExecTool" in class_names
+    assert "CliAppsTool" in class_names
     assert "MessageTool" in class_names
+    assert "MyTool" in class_names
     assert "SpawnTool" in class_names
+    assert "ExecSessionTool" in class_names
 
 
 def test_discover_excludes_abstract_and_mcp():
@@ -112,9 +116,65 @@ def test_discover_skips_private_classes():
         assert not cls.__name__.startswith("_")
 
 
-# --- Task 4: _FsTool.create() ---
+def test_loader_registers_exec_with_real_tools_config(tmp_path):
+    """Real config objects catch bad ctx.config attribute paths that mocks hide."""
+    from types import SimpleNamespace
 
-from pathlib import Path
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.config.schema import ToolsConfig
+
+    ctx = ToolContext(
+        config=ToolsConfig(),
+        workspace=str(tmp_path),
+        bus=None,
+        subagent_manager=SimpleNamespace(
+            get_running_count=lambda: 0,
+            max_concurrent_subagents=4,
+        ),
+        cron_service=None,
+        timezone="UTC",
+    )
+    registry = ToolRegistry()
+    registered = ToolLoader().load(ctx, registry)
+
+    assert "exec" in registered
+    assert registry.has("exec")
+
+
+def test_loader_wires_shared_exec_session_manager(tmp_path):
+    from types import SimpleNamespace
+
+    from nanobot.agent.tools.exec_session import ExecSessionManager
+    from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.config.schema import ToolsConfig
+
+    manager = ExecSessionManager()
+    ctx = ToolContext(
+        config=ToolsConfig(),
+        workspace=str(tmp_path),
+        subagent_manager=SimpleNamespace(
+            get_running_count=lambda: 0,
+            max_concurrent_subagents=4,
+        ),
+        exec_session_manager=manager,
+        timezone="UTC",
+    )
+    registry = ToolRegistry()
+    ToolLoader().load(ctx, registry)
+
+    assert registry.get("exec")._session_manager is manager
+    assert registry.get("exec_session")._manager is manager
+    assert registry.get("write_stdin") is None
+    assert registry.get("list_exec_sessions")._manager is manager
+    definition_names = {
+        definition["function"]["name"]
+        for definition in registry.get_definitions()
+    }
+    assert "exec_session" in definition_names
+    assert "write_stdin" not in definition_names
+
+
+# --- Task 4: _FsTool.create() ---
 
 
 def test_fs_tool_create_builds_from_context():
@@ -221,6 +281,7 @@ def test_exec_tool_create():
     mock_config.exec.enable = True
     mock_config.exec.timeout = 120
     mock_config.exec.sandbox = ""
+    mock_config.exec.path_prepend = "/venv/bin"
     mock_config.exec.path_append = ""
     mock_config.exec.allowed_env_keys = []
     mock_config.exec.allow_patterns = []
@@ -229,10 +290,11 @@ def test_exec_tool_create():
     ctx = ToolContext(config=mock_config, workspace="/tmp")
     tool = ExecTool.create(ctx)
     assert isinstance(tool, ExecTool)
+    assert tool.path_prepend == "/venv/bin"
 
 
 def test_web_tools_config_cls():
-    from nanobot.agent.tools.web import WebSearchTool, WebFetchTool, WebToolsConfig
+    from nanobot.agent.tools.web import WebFetchTool, WebSearchTool, WebToolsConfig
     assert WebSearchTool.config_key == "web"
     assert WebSearchTool.config_cls() is WebToolsConfig
     assert WebFetchTool.config_key == "web"
@@ -314,57 +376,31 @@ def test_my_tool_enabled():
     from nanobot.agent.tools.self import MyTool
     mock_config = MagicMock()
     mock_config.my.enable = True
-    ctx = ToolContext(config=mock_config, workspace="/tmp")
+    ctx = ToolContext(
+        config=mock_config,
+        workspace="/tmp",
+        runtime_control=MagicMock(),
+    )
     assert MyTool.enabled(ctx) is True
     mock_config.my.enable = False
     assert MyTool.enabled(ctx) is False
 
 
+def test_my_tool_requires_runtime_control():
+    from nanobot.agent.tools.self import MyTool
+
+    mock_config = MagicMock()
+    mock_config.my.enable = True
+    ctx = ToolContext(config=mock_config, workspace="/tmp")
+
+    assert MyTool.enabled(ctx) is False
+
+
 def test_mcp_wrappers_not_discoverable():
-    from nanobot.agent.tools.mcp import MCPToolWrapper, MCPResourceWrapper, MCPPromptWrapper
+    from nanobot.agent.tools.mcp import MCPPromptWrapper, MCPResourceWrapper, MCPToolWrapper
     assert MCPToolWrapper._plugin_discoverable is False
     assert MCPResourceWrapper._plugin_discoverable is False
     assert MCPPromptWrapper._plugin_discoverable is False
-
-
-# --- Task 8: Config round-trip tests ---
-
-
-def test_config_round_trip():
-    """Verify config serialization is unchanged after moving config classes."""
-    from nanobot.config.schema import Config
-
-    config_dict = {
-        "tools": {
-            "web": {"enable": True, "search": {"provider": "brave", "api_key": "test"}},
-            "exec": {"enable": False, "timeout": 120},
-            "my": {"allowSet": True},
-            "imageGeneration": {"enabled": True, "provider": "openrouter"},
-        }
-    }
-    config = Config.model_validate(config_dict)
-    dumped = config.model_dump(mode="json", by_alias=True)
-
-    assert dumped["tools"]["my"]["allowSet"] is True
-    assert dumped["tools"]["imageGeneration"]["enabled"] is True
-    assert config.tools.exec.enable is False
-    assert config.tools.exec.timeout == 120
-    assert config.tools.web.search.provider == "brave"
-
-
-def test_config_defaults():
-    """Verify default values match the original hardcoded schema."""
-    from nanobot.config.schema import Config
-
-    config = Config.model_validate({})
-    assert config.tools.exec.enable is True
-    assert config.tools.exec.timeout == 60
-    assert config.tools.web.enable is True
-    assert config.tools.web.search.provider == "duckduckgo"
-    assert config.tools.my.enable is True
-    assert config.tools.my.allow_set is False
-    assert config.tools.image_generation.enabled is False
-    assert config.tools.restrict_to_workspace is False
 
 
 # --- Task 10: Integration test ---
@@ -379,6 +415,7 @@ def test_loader_registers_same_tools_as_old_hardcoded():
     mock_config.exec.enable = True
     mock_config.exec.timeout = 60
     mock_config.exec.sandbox = ""
+    mock_config.exec.path_prepend = ""
     mock_config.exec.path_append = ""
     mock_config.exec.allowed_env_keys = []
     mock_config.exec.allow_patterns = []
@@ -391,6 +428,7 @@ def test_loader_registers_same_tools_as_old_hardcoded():
     mock_config.web.user_agent = None
     mock_config.image_generation.enabled = False
     mock_config.my.enable = True
+    mock_config.my.allow_set = False
 
     ctx = ToolContext(
         config=mock_config,
@@ -399,6 +437,7 @@ def test_loader_registers_same_tools_as_old_hardcoded():
         subagent_manager=MagicMock(),
         cron_service=MagicMock(),
         timezone="UTC",
+        runtime_control=MagicMock(),
     )
     registry = ToolRegistry()
     loader = ToolLoader()
@@ -406,8 +445,10 @@ def test_loader_registers_same_tools_as_old_hardcoded():
 
     expected = {
         "read_file", "write_file", "edit_file", "list_dir",
-        "grep", "notebook_edit", "exec", "web_search", "web_fetch",
+        "find_files", "grep", "exec", "exec_session", "list_exec_sessions",
+        "web_search", "web_fetch",
         "message", "spawn", "cron",
+        "my",
     }
     actual = set(registered)
     assert expected <= actual, f"Missing tools: {expected - actual}"

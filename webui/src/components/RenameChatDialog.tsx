@@ -15,6 +15,9 @@ import { Input } from "@/components/ui/input";
 interface RenameChatDialogProps {
   open: boolean;
   title: string;
+  dialogTitle?: string;
+  description?: string;
+  placeholder?: string;
   onCancel: () => void;
   onConfirm: (title: string) => void;
 }
@@ -22,6 +25,9 @@ interface RenameChatDialogProps {
 export function RenameChatDialog({
   open,
   title,
+  dialogTitle,
+  description,
+  placeholder,
   onCancel,
   onConfirm,
 }: RenameChatDialogProps) {
@@ -38,7 +44,7 @@ export function RenameChatDialog({
     <Dialog open={open} onOpenChange={(next) => {
       if (!next) onCancel();
     }}>
-      <DialogContent className="max-w-sm rounded-[22px] border-border/70 bg-popover p-5 shadow-2xl">
+      <DialogContent className="max-w-sm">
         <form
           className="grid gap-4"
           onSubmit={(event) => {
@@ -48,23 +54,28 @@ export function RenameChatDialog({
           }}
         >
           <DialogHeader className="text-left">
-            <DialogTitle>{t("chat.renameTitle")}</DialogTitle>
+            <DialogTitle>{dialogTitle ?? t("chat.renameTitle")}</DialogTitle>
             <DialogDescription>
-              {t("chat.renameDescription")}
+              {description ?? t("chat.renameDescription")}
             </DialogDescription>
           </DialogHeader>
           <Input
             value={value}
             onChange={(event) => setValue(event.target.value)}
-            placeholder={t("chat.renamePlaceholder")}
+            placeholder={placeholder ?? t("chat.renamePlaceholder")}
             autoFocus
             maxLength={160}
           />
-          <DialogFooter className="gap-2 sm:space-x-0">
-            <Button type="button" variant="outline" onClick={onCancel}>
+          <DialogFooter>
+            <Button
+              className="min-w-20"
+              type="button"
+              variant="outline"
+              onClick={onCancel}
+            >
               {t("deleteConfirm.cancel")}
             </Button>
-            <Button type="submit" disabled={!trimmed}>
+            <Button className="min-w-20" type="submit" disabled={!trimmed}>
               {t("chat.renameSave")}
             </Button>
           </DialogFooter>
